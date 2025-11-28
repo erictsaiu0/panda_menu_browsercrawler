@@ -1,0 +1,6 @@
+/.venv
+/__pycache__
+/logs
+/panda_data_py
+/session_cookies.json
+/session_state.json
