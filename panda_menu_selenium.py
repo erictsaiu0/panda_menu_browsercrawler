@@ -9,6 +9,8 @@ import random
 import time
 from datetime import datetime
 from pathlib import Path
+import platform
+import shutil
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -49,7 +51,7 @@ CURRENT_FAST_MODE = BLOCK_HEAVY_ASSETS
 CURRENT_BROWSER = os.environ.get("SELENIUM_BROWSER", "firefox").lower()
 
 # 遇到 recaptcha 時等候的秒數，之後自動跳過
-RECAPTCHA_WAIT = int(os.environ.get("RECAPTCHA_WAIT", "60"))
+RECAPTCHA_WAIT = int(os.environ.get("RECAPTCHA_WAIT", "120"))
 
 # Selenium 等待頁面載入的最大秒數
 PAGE_LOAD_TIMEOUT = 60
@@ -66,16 +68,20 @@ ACCESS_DENIED_MARKERS = (
 
 BASE_DIR = Path(__file__).resolve().parent
 
+SYSTEM = platform.system().lower()
+MACHINE = platform.machine().lower()
+IS_RPI = SYSTEM == "linux" and ("arm" in MACHINE or "aarch64" in MACHINE)
+
 # 輸入的店家清單（跟 main.js 一樣）
-LOCATION_CSV_PATH = Path.home() / "panda_data" / "shopLst" / "rolling.csv"
+LOCATION_CSV_PATH = BASE_DIR / "panda_data" / "shopLst" / "rolling.csv"
 
 # 輸出的 JSON 目錄（用 python 版，避免和 js 混在一起）
 TODAY = datetime.now().strftime("%Y-%m-%d")
-OUTPUT_BASE = Path("panda_data_py") / "panda_menu"
+OUTPUT_BASE = BASE_DIR / "panda_data_py" / "panda_menu"
 OUTPUT_DIR = OUTPUT_BASE / TODAY
 
 # log 檔
-LOG_DIR = Path("logs")
+LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / f"{TODAY}.log"
 
 # cookie / session 相關設定
@@ -84,14 +90,120 @@ COOKIES_PATH = BASE_DIR / "session_cookies.json"
 MAX_ACCESS_DENIED_RETRIES = 3
 COOKIE_ALLOWED_KEYS = {"name", "value", "domain", "path", "expiry", "secure", "httpOnly"}
 
+# 自動偵測各平臺的瀏覽器與 driver 路徑
+def _build_binary_candidates():
+    driver_dir = BASE_DIR / "drivers"
+    candidates = {
+        "chromium": [],
+        "chromedriver": [driver_dir / "chromedriver", driver_dir / "chromedriver.exe"],
+        "geckodriver": [driver_dir / "geckodriver", driver_dir / "geckodriver.exe"],
+        "firefox": [],
+    }
+
+    if SYSTEM == "windows":
+        program_files = Path(os.environ.get("PROGRAMFILES", r"C:\\Program Files"))
+        program_files_x86 = Path(os.environ.get("PROGRAMFILES(X86)", r"C:\\Program Files (x86)"))
+        candidates["chromium"] += [
+            program_files / "Google" / "Chrome" / "Application" / "chrome.exe",
+            program_files_x86 / "Google" / "Chrome" / "Application" / "chrome.exe",
+            program_files / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+        ]
+        candidates["chromedriver"] += [
+            program_files / "Google" / "Chrome" / "Application" / "chromedriver.exe",
+            program_files_x86 / "Google" / "Chrome" / "Application" / "chromedriver.exe",
+        ]
+        candidates["firefox"] += [
+            program_files / "Mozilla Firefox" / "firefox.exe",
+            program_files_x86 / "Mozilla Firefox" / "firefox.exe",
+        ]
+        candidates["geckodriver"] += [
+            program_files / "Mozilla Firefox" / "geckodriver.exe",
+            program_files_x86 / "Mozilla Firefox" / "geckodriver.exe",
+        ]
+    elif SYSTEM == "darwin":
+        candidates["chromium"] += [
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            Path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+        ]
+        candidates["chromedriver"] += [
+            Path("/usr/local/bin/chromedriver"),
+            Path("/opt/homebrew/bin/chromedriver"),
+        ]
+        candidates["firefox"] += [
+            Path("/Applications/Firefox.app/Contents/MacOS/firefox"),
+        ]
+        candidates["geckodriver"] += [
+            Path("/usr/local/bin/geckodriver"),
+            Path("/opt/homebrew/bin/geckodriver"),
+        ]
+    else:
+        linux_chromium = [
+            Path("/usr/bin/chromium-browser"),
+            Path("/usr/bin/chromium"),
+            Path("/usr/bin/google-chrome"),
+            Path("/usr/bin/google-chrome-stable"),
+        ]
+        if IS_RPI:
+            linux_chromium.insert(0, Path("/usr/bin/chromium-browser"))
+        candidates["chromium"] += linux_chromium
+        candidates["chromedriver"] += [
+            Path("/usr/bin/chromedriver"),
+            Path("/usr/local/bin/chromedriver"),
+        ]
+        candidates["firefox"] += [
+            Path("/usr/bin/firefox"),
+            Path("/snap/bin/firefox"),
+        ]
+        candidates["geckodriver"] += [
+            Path("/usr/bin/geckodriver"),
+            Path("/usr/local/bin/geckodriver"),
+        ]
+
+    return candidates
+
+
+def _resolve_binary(env_key, candidates, which_names):
+    override = os.environ.get(env_key)
+    if override:
+        return Path(override)
+
+    for name in which_names:
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+
+    for path_candidate in candidates:
+        if path_candidate and Path(path_candidate).exists():
+            return Path(path_candidate)
+
+    if candidates:
+        return Path(candidates[0])
+    return Path(override or which_names[0])
+
+BINARY_CANDIDATES = _build_binary_candidates()
+
 # Chromium / chromedriver 路徑
-CHROMIUM_BINARY = Path(os.environ.get("CHROMIUM_BINARY", "/usr/bin/chromium-browser"))
-CHROMEDRIVER_BINARY = Path(
-    os.environ.get("CHROMEDRIVER_BINARY", "/usr/bin/chromedriver")
+CHROMIUM_BINARY = _resolve_binary(
+    "CHROMIUM_BINARY",
+    BINARY_CANDIDATES["chromium"],
+    ["chromium-browser", "chromium", "google-chrome", "chrome"],
+)
+CHROMEDRIVER_BINARY = _resolve_binary(
+    "CHROMEDRIVER_BINARY",
+    BINARY_CANDIDATES["chromedriver"],
+    ["chromedriver"],
 )
 CHROME_FAST_SETTINGS = {}
-GECKODRIVER_BINARY = Path(os.environ.get("GECKODRIVER_BINARY", "/usr/local/bin/geckodriver"))
-FIREFOX_BINARY = Path(os.environ.get("FIREFOX_BINARY", "/usr/bin/firefox"))
+GECKODRIVER_BINARY = _resolve_binary(
+    "GECKODRIVER_BINARY",
+    BINARY_CANDIDATES["geckodriver"],
+    ["geckodriver"],
+)
+FIREFOX_BINARY = _resolve_binary(
+    "FIREFOX_BINARY",
+    BINARY_CANDIDATES["firefox"],
+    ["firefox"],
+)
 
 
 def switch_to_chrome():
@@ -111,9 +223,23 @@ logging.basicConfig(
     filename=str(LOG_FILE),
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    encoding="utf-8",
 )
 
 logger = logging.getLogger("panda_menu_selenium")
+logger.info(
+    "[CONFIG] Detected platform=%s machine=%s browser=%s",
+    SYSTEM,
+    MACHINE,
+    CURRENT_BROWSER,
+)
+logger.info(
+    "[CONFIG] chromium=%s chromedriver=%s firefox=%s geckodriver=%s",
+    CHROMIUM_BINARY,
+    CHROMEDRIVER_BINARY,
+    FIREFOX_BINARY,
+    GECKODRIVER_BINARY,
+)
 
 
 # ============================================
@@ -381,12 +507,12 @@ def handle_access_denied(driver, url, allow_skip=False):
     wait_seconds = max(0, RECAPTCHA_WAIT)
     if wait_seconds:
         logger.info(
-            f"[BLOCKED] Detected captcha at {url}. Cooling down for {wait_seconds}s before skipping."
+            f"[BLOCKED] Detected captcha at {url}. Cooling down for {wait_seconds}s before deciding."
         )
         time.sleep(wait_seconds)
 
     if allow_skip:
-        logger.info(f"[BLOCKED] Auto-skipping {url} after cooldown.")
+        logger.info(f"[BLOCKED] Cooldown finished for {url}, skipping request.")
         return "skip"
 
     logger.info(f"[BLOCKED] Cooldown finished for {url}, retrying request.")
@@ -486,6 +612,34 @@ def renew_session(driver, reason=""):
 # 從瀏覽器裡抽出 JSON state
 # ============================================
 
+def perform_random_scrolls(driver, max_scrolls=4):
+    """Add some human-like scrolling to trigger lazy-loaded content."""
+    try:
+        scroll_height = driver.execute_script(
+            "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
+        )
+    except Exception as e:
+        logger.debug(f"[SCROLL] Unable to read scroll height: {e}")
+        return
+
+    if not scroll_height or scroll_height <= 0:
+        return
+
+    current_y = 0
+    steps = random.randint(1, max_scrolls)
+    for _ in range(steps):
+        # Move up or down by a random chunk of the page height.
+        delta = random.randint(max(20, int(scroll_height * 0.05)), max(40, int(scroll_height * 0.25)))
+        direction = 1 if random.random() < 0.65 else -1
+        current_y = max(0, min(scroll_height, current_y + direction * delta))
+        try:
+            driver.execute_script("window.scrollTo({top: arguments[0], behavior:'smooth'});", current_y)
+        except Exception as e:
+            logger.debug(f"[SCROLL] Failed to scroll: {e}")
+            break
+        time.sleep(random.uniform(0.4, 1.2))
+
+
 def fetch_page_source(driver, url):
     start_time = time.perf_counter()
     logger.info(f"[OPEN] {url}")
@@ -500,6 +654,7 @@ def fetch_page_source(driver, url):
 
     extra_sleep = random.uniform(2, 5)
     time.sleep(extra_sleep)
+    perform_random_scrolls(driver)
 
     page_source = driver.page_source
     ensure_not_blocked(page_source, url)
@@ -695,23 +850,20 @@ def main():
                     break
                 except AccessDeniedError as blocked:
                     decision = handle_access_denied(driver, url, allow_skip=True)
-                    if decision == "retry":
-                        continue
                     if decision == "skip":
+                        logger.warning(
+                            f"[BLOCKED] {shop_code} ({shop_name}) -> skipping after captcha: {blocked}"
+                        )
                         data = None
                         break
-                    logger.warning(
-                        f"[BLOCKED] {shop_code} ({shop_name}) attempt {attempt}/"
-                        f"{MAX_ACCESS_DENIED_RETRIES}: {blocked}"
-                    )
-                    if attempt == MAX_ACCESS_DENIED_RETRIES:
-                        data = None
-                        break
-                    renew_session(
-                        driver, reason=f"{shop_code} blocked (attempt {attempt})"
-                    )
-                    time.sleep(random.uniform(6, 10))
                     attempt += 1
+                    if attempt > MAX_ACCESS_DENIED_RETRIES:
+                        logger.warning(
+                            f"[BLOCKED] {shop_code} ({shop_name}) reached max retries ({MAX_ACCESS_DENIED_RETRIES})."
+                        )
+                        data = None
+                        break
+                    continue
                 except Exception as e:
                     logger.error(f"[ERROR] {shop_code} ({shop_name}) at ({lat}, {lng}): {e}")
                     data = None

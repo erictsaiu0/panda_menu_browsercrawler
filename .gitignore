@@ -4,3 +4,7 @@
 /panda_data_py
 /session_cookies.json
 /session_state.json
+panda_data/shopLst/rolling.csv
+.gitignore
+.vscode/settings.json
+drivers/geckodriver.exe
