@@ -51,7 +51,7 @@ CURRENT_FAST_MODE = BLOCK_HEAVY_ASSETS
 CURRENT_BROWSER = os.environ.get("SELENIUM_BROWSER", "firefox").lower()
 
 # 遇到 recaptcha 時等候的秒數，之後自動跳過
-RECAPTCHA_WAIT = int(os.environ.get("RECAPTCHA_WAIT", "120"))
+RECAPTCHA_WAIT = int(os.environ.get("RECAPTCHA_WAIT", "60"))
 
 # Selenium 等待頁面載入的最大秒數
 PAGE_LOAD_TIMEOUT = 60
@@ -87,8 +87,10 @@ LOG_FILE = LOG_DIR / f"{TODAY}.log"
 # cookie / session 相關設定
 HOME_URL = "https://www.foodpanda.com.tw/"
 COOKIES_PATH = BASE_DIR / "session_cookies.json"
-MAX_ACCESS_DENIED_RETRIES = 3
+MAX_ACCESS_DENIED_RETRIES = 2
 COOKIE_ALLOWED_KEYS = {"name", "value", "domain", "path", "expiry", "secure", "httpOnly"}
+FIRST_MANUAL_CAPTCHA_WAIT_SEC = 20
+FIRST_MANUAL_CAPTCHA_PENDING = True
 
 # 自動偵測各平臺的瀏覽器與 driver 路徑
 def _build_binary_candidates():
@@ -387,6 +389,19 @@ def output_file_for(lat, lng, shop_code, ext="json"):
     return OUTPUT_DIR / f"{lat}_{lng}_{shop_code}.{ext}"
 
 
+def progress_snapshot(run_start_time, success_count, skip_count, total_count):
+    processed = success_count + skip_count
+    elapsed = time.perf_counter() - run_start_time
+    avg_seconds = elapsed / processed if processed else 0.0
+    remaining = max(0, total_count - processed)
+    eta_seconds = remaining * avg_seconds
+    days = int(eta_seconds // 86400)
+    hours = int((eta_seconds % 86400) // 3600)
+    minutes = int((eta_seconds % 3600) // 60)
+    eta_str = f"{days}:{hours:02}:{minutes:02}"
+    return f"success={success_count} skip={skip_count} avg={avg_seconds:.1f}s ETA={eta_str}"
+
+
 def ensure_not_blocked(page_source, url):
     if not is_access_denied(page_source):
         return
@@ -504,18 +519,38 @@ def set_driver_assets(driver, enable_heavy_assets):
 
 
 def handle_access_denied(driver, url, allow_skip=False):
-    wait_seconds = max(0, RECAPTCHA_WAIT)
-    if wait_seconds:
+    global FIRST_MANUAL_CAPTCHA_PENDING
+    if FIRST_MANUAL_CAPTCHA_PENDING:
+        wait_seconds = FIRST_MANUAL_CAPTCHA_WAIT_SEC
+        FIRST_MANUAL_CAPTCHA_PENDING = False
         logger.info(
-            f"[BLOCKED] Detected captcha at {url}. Cooling down for {wait_seconds}s before deciding."
+            f"[BLOCKED] First captcha encountered at {url}. Please solve it manually in the browser window. Retrying after {wait_seconds}s."
         )
+        if HEADLESS:
+            logger.warning("[BLOCKED] Running headless makes manual captcha solving impossible.")
+    else:
+        wait_seconds = max(0, RECAPTCHA_WAIT)
+        logger.info(
+            f"[BLOCKED] Detected captcha at {url}. Cooling down for {wait_seconds}s before retry."
+        )
+
+    if wait_seconds:
         time.sleep(wait_seconds)
 
-    if allow_skip:
-        logger.info(f"[BLOCKED] Cooldown finished for {url}, skipping request.")
-        return "skip"
+    session_reason = f"captcha detected while loading {url}"
+    try:
+        renew_session(driver, reason=session_reason)
+    except AccessDeniedError as renew_err:
+        logger.warning(f"[BLOCKED] Session renew after captcha also blocked: {renew_err}")
+    except Exception as renew_err:
+        logger.warning(f"[BLOCKED] Session renew failed: {renew_err}")
 
-    logger.info(f"[BLOCKED] Cooldown finished for {url}, retrying request.")
+    if allow_skip:
+        logger.info(
+            f"[BLOCKED] Cooldown finished for {url}, retrying request (skip if captcha persists)."
+        )
+    else:
+        logger.info(f"[BLOCKED] Cooldown finished for {url}, retrying request.")
     if BLOCK_HEAVY_ASSETS:
         set_driver_assets(driver, enable_heavy_assets=False)
     return "retry"
@@ -816,6 +851,11 @@ def main():
         stores = [stores[0]]
         logger.info(f"[DEBUG] Only crawling first store: {stores[0]}")
 
+    total_stores = len(stores)
+    success_count = 0
+    skip_count = 0
+    run_start = time.perf_counter()
+
     driver = create_webdriver()
 
     try:
@@ -833,13 +873,14 @@ def main():
                 PER_REQUEST_DELAY_MIN_SEC, PER_REQUEST_DELAY_MAX_SEC
             )
             logger.info(
-                f"[SLEEP] {delay_sec:.1f}s before requesting {shop_code} ({idx}/{len(stores)})"
+                f"[SLEEP] {delay_sec:.1f}s before requesting {shop_code} ({idx}/{total_stores})"
             )
             time.sleep(delay_sec)
 
             attempt = 1
             data = None
             page_html = None
+            skip_reason = None
             while attempt <= MAX_ACCESS_DENIED_RETRIES:
                 try:
                     if CRAWL_HTML_ONLY:
@@ -849,29 +890,30 @@ def main():
                         data = grab_page_json(driver, url)
                     break
                 except AccessDeniedError as blocked:
-                    decision = handle_access_denied(driver, url, allow_skip=True)
-                    if decision == "skip":
-                        logger.warning(
-                            f"[BLOCKED] {shop_code} ({shop_name}) -> skipping after captcha: {blocked}"
-                        )
-                        data = None
-                        break
+                    handle_access_denied(driver, url, allow_skip=True)
                     attempt += 1
                     if attempt > MAX_ACCESS_DENIED_RETRIES:
                         logger.warning(
-                            f"[BLOCKED] {shop_code} ({shop_name}) reached max retries ({MAX_ACCESS_DENIED_RETRIES})."
+                            f"[BLOCKED] {shop_code} ({shop_name}) -> skipping after captcha retries ({MAX_ACCESS_DENIED_RETRIES})."
                         )
+                        skip_reason = "captcha"
                         data = None
                         break
                     continue
                 except Exception as e:
                     logger.error(f"[ERROR] {shop_code} ({shop_name}) at ({lat}, {lng}): {e}")
+                    skip_reason = "error"
                     data = None
                     break
+
+            if skip_reason:
+                skip_count += 1
+                continue
 
             if CRAWL_HTML_ONLY:
                 if not page_html:
                     logger.warning(f"[NO_HTML] {shop_code} ({shop_name}) -> no HTML captured")
+                    skip_count += 1
                     continue
                 data = extract_vendor_payload(page_html)
                 if data is None:
@@ -879,10 +921,12 @@ def main():
                         f"[NO_DATA] {shop_code} ({shop_name}) -> HTML parse failed"
                     )
                     _dump_json_debug(page_html, url, suffix="html_parse_failed")
+                    skip_count += 1
                     continue
             else:
                 if data is None:
                     logger.warning(f"[NO_DATA] {shop_code} ({shop_name}) -> no JSON extracted")
+                    skip_count += 1
                     continue
 
             # 輸出路徑：{lat}_{lng}_{shopCode}.json
@@ -890,9 +934,12 @@ def main():
             try:
                 with open(out_file, "w", encoding="utf-8") as fw:
                     json.dump(data, fw, ensure_ascii=False, indent=2)
-                logger.info(f"[OK] Saved JSON for {shop_code} to {out_file}")
+                success_count += 1
+                status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
+                logger.info(f"[OK] Saved JSON for {shop_code} to {out_file} | {status_line}")
             except Exception as e:
                 logger.error(f"[ERROR] write {out_file}: {e}")
+                skip_count += 1
 
     finally:
         persist_cookies(driver)
