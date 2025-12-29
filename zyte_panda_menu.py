@@ -1,0 +1,600 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Foodpanda menu crawler powered by Zyte API (Smart Proxy Manager backend).
+
+This variant mirrors the Bright Data Unlocker workflow but uses Zyte's hosted
+REST API to fetch/render each restaurant page server-side. The JSON extraction
+helpers stay untouched so downstream payloads remain identical.
+"""
+
+import base64
+import certifi
+import csv
+import json
+import logging
+import os
+import random
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import dotenv
+import requests
+import urllib3
+from requests.exceptions import RequestException, SSLError
+
+dotenv.load_dotenv()
+
+
+class AccessDeniedError(RuntimeError):
+    """Raised when Foodpanda serves a captcha/block page."""
+
+    pass
+
+
+# ============================================
+# Basic configuration
+# ============================================
+
+DEBUG_MODE = False
+PER_REQUEST_DELAY_MIN_SEC = float(os.environ.get("PANDA_DELAY_MIN", "0"))
+PER_REQUEST_DELAY_MAX_SEC = float(os.environ.get("PANDA_DELAY_MAX", "1"))
+CRAWL_HTML_ONLY = True
+
+RECAPTCHA_WAIT = int(os.environ.get("RECAPTCHA_WAIT", "60"))
+MAX_ACCESS_DENIED_RETRIES = int(os.environ.get("MAX_ACCESS_DENIED_RETRIES", "2"))
+SKIP_EXISTING_OUTPUT = os.environ.get("PANDA_SKIP_EXISTING", "1") not in ("0", "false", "False")
+DEDUP_SHOP_CODES = os.environ.get("PANDA_DEDUP_SHOPS", "1") not in ("0", "false", "False")
+
+# ============================================
+# Path & logging setup
+# ============================================
+
+BASE_DIR = Path(__file__).resolve().parent
+LOCATION_CSV_PATH = BASE_DIR / "panda_data" / "shopLst" / "rolling.csv"
+TODAY = datetime.now().strftime("%Y-%m-%d")
+OUTPUT_BASE = BASE_DIR / "panda_data_py" / "panda_menu"
+OUTPUT_DIR = OUTPUT_BASE / TODAY
+LOG_DIR = BASE_DIR / "logs"
+LOG_FILE = LOG_DIR / f"{TODAY}.log"
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+logging.basicConfig(
+    filename=str(LOG_FILE),
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    encoding="utf-8",
+)
+logger = logging.getLogger("panda_menu_zyte")
+
+
+# ============================================
+# Zyte API configuration
+# ============================================
+
+ZYTE_API_KEY = (
+    os.environ.get("ZYTE_API_KEY")
+    or os.environ.get("CRAWLERA_API_KEY")
+    or os.environ.get("CRAWLERA_APIKEY")
+)
+if not ZYTE_API_KEY:
+    raise RuntimeError("ZYTE_API_KEY (or legacy CRAWLERA_API_KEY) is required.")
+
+ZYTE_API_ENDPOINT = os.environ.get("ZYTE_API_ENDPOINT", "https://api.zyte.com/v1/extract")
+ZYTE_FOLLOW_REDIRECT = os.environ.get("ZYTE_FOLLOW_REDIRECT", "1") not in ("0", "false", "False")
+ZYTE_GEO_LOCATION = os.environ.get("ZYTE_REGION") or os.environ.get("ZYTE_COUNTRY")
+ZYTE_MAX_FETCH_RETRIES = int(os.environ.get("ZYTE_MAX_FETCH_RETRIES", "3"))
+ZYTE_TIMEOUT = float(os.environ.get("ZYTE_TIMEOUT", "60"))
+ZYTE_VERIFY_SSL = os.environ.get("ZYTE_VERIFY_SSL", "1") not in ("0", "false", "False")
+ZYTE_CA_BUNDLE = os.environ.get("ZYTE_CA_BUNDLE")
+ZYTE_SERVER_ERROR_SLEEP = float(os.environ.get("ZYTE_SERVER_ERROR_SLEEP", "15"))
+ZYTE_SSL_AUTO_FALLBACK = os.environ.get("ZYTE_SSL_AUTO_FALLBACK", "1") not in ("0", "false", "False")
+ZYTE_SUPPRESS_INSECURE_WARNING = (
+    os.environ.get("ZYTE_SUPPRESS_INSECURE_WARNING", "1") not in ("0", "false", "False")
+)
+ZYTE_REQUEST_BROWSER_HTML = os.environ.get("ZYTE_BROWSER_HTML", "0") not in ("0", "false", "False")
+DEFAULT_ZYTE_CA_PATH = BASE_DIR / "zyte-ca.crt"
+if not ZYTE_CA_BUNDLE and DEFAULT_ZYTE_CA_PATH.exists():
+    ZYTE_CA_BUNDLE = str(DEFAULT_ZYTE_CA_PATH)
+
+
+def set_browser_rendering(enabled: bool) -> None:
+    """Toggle Zyte browserHtml rendering at runtime (used by zyte_test)."""
+    global ZYTE_REQUEST_BROWSER_HTML
+    ZYTE_REQUEST_BROWSER_HTML = enabled
+    logger.info("[CONFIG] Zyte browserHtml rendering = %s", enabled)
+
+
+def _compose_verify_bundle() -> Optional[str]:
+    """
+    Requests relies on certifi CA store and ignores OS additions. When a Zyte CA
+    is provided, append it to certifi's bundle so TLS verification succeeds.
+    """
+    if not ZYTE_CA_BUNDLE:
+        return certifi.where()
+
+    zyte_path = Path(ZYTE_CA_BUNDLE)
+    if not zyte_path.exists():
+        logger.warning("[SSL] ZYTE_CA_BUNDLE not found at %s", zyte_path)
+        return certifi.where()
+
+    merged_path = BASE_DIR / ".zyte_certifi_bundle.pem"
+    try:
+        with open(certifi.where(), "rb") as base_fp, open(zyte_path, "rb") as zyte_fp:
+            base_data = base_fp.read()
+            custom_data = zyte_fp.read()
+        with open(merged_path, "wb") as out_fp:
+            out_fp.write(base_data)
+            if not base_data.endswith(b"\n"):
+                out_fp.write(b"\n")
+            out_fp.write(custom_data)
+            if not custom_data.endswith(b"\n"):
+                out_fp.write(b"\n")
+        logger.info("[SSL] Composed certifi bundle with Zyte CA -> %s", merged_path)
+        return str(merged_path)
+    except Exception as exc:
+        logger.warning("[SSL] Failed to compose Zyte CA bundle: %s", exc)
+        return certifi.where()
+
+session = requests.Session()
+session.auth = (ZYTE_API_KEY, "")
+session.headers.update({"Content-Type": "application/json"})
+verify_path = _compose_verify_bundle()
+if verify_path and ZYTE_VERIFY_SSL:
+    session.verify = verify_path
+elif not ZYTE_VERIFY_SSL:
+    session.verify = False
+if isinstance(session.verify, bool) and session.verify is False and ZYTE_SUPPRESS_INSECURE_WARNING:
+    try:
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+
+SSL_FALLBACK_ACTIVE = isinstance(session.verify, bool) and session.verify is False
+
+verify_label = ZYTE_CA_BUNDLE if ZYTE_CA_BUNDLE else str(ZYTE_VERIFY_SSL)
+logger.info(
+    "[CONFIG] Zyte API endpoint=%s geo=%s retries=%s timeout=%.0fs verify_ssl=%s render_html=%s",
+    ZYTE_API_ENDPOINT,
+    ZYTE_GEO_LOCATION or "(default)",
+    ZYTE_MAX_FETCH_RETRIES,
+    ZYTE_TIMEOUT,
+    verify_label,
+    ZYTE_REQUEST_BROWSER_HTML,
+)
+
+
+# ============================================
+# Helper utilities
+# ============================================
+
+ACCESS_DENIED_MARKERS = (
+    "Access to this page has been denied",
+    "px-captcha",
+)
+
+
+def output_file_for(lat: float, lng: float, shop_code: str, ext: str = "json") -> Path:
+    return OUTPUT_DIR / f"{lat}_{lng}_{shop_code}.{ext}"
+
+
+def _dump_access_denied_html(page_source: str, url: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = url.rstrip("/").split("/")[-1] or "homepage"
+    dump_path = LOG_DIR / f"access_denied_{suffix}_{timestamp}.html"
+    try:
+        dump_path.write_text(page_source, encoding="utf-8")
+        logger.error(
+            "[BLOCKED] Access denied / captcha detected for %s. Dumped HTML to %s",
+            url,
+            dump_path,
+        )
+    except Exception as dump_err:
+        logger.error(
+            "[BLOCKED] Access denied for %s, but failed to dump HTML: %s",
+            url,
+            dump_err,
+        )
+    return dump_path
+
+
+def _dump_json_debug(payload: str, url: str, suffix: str = "debug") -> None:
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        slug = url.rstrip("/").split("/")[-1] or "homepage"
+        out = LOG_DIR / f"json_{slug}_{suffix}_{timestamp}.txt"
+        out.write_text(
+            payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info("[DEBUG] Dumped JSON payload for %s to %s", url, out)
+    except Exception as e:
+        logger.warning("[DEBUG] Failed to dump JSON payload for %s: %s", url, e)
+
+
+def is_access_denied(page_source: str) -> bool:
+    if not page_source:
+        return False
+    return any(marker in page_source for marker in ACCESS_DENIED_MARKERS)
+
+
+def ensure_not_blocked(page_source: str, url: str) -> None:
+    if not is_access_denied(page_source):
+        return
+    _dump_access_denied_html(page_source, url)
+    raise AccessDeniedError(
+        "Foodpanda returned an Access Denied / captcha page. "
+        "Slow down, try a residential IP, or wait before retrying."
+    )
+
+
+# ============================================
+# SSL fallback helper
+# ============================================
+
+
+def _enable_ssl_insecure_mode(reason: str) -> bool:
+    """Disable certificate verification mid-run if allowed."""
+    global SSL_FALLBACK_ACTIVE
+    if SSL_FALLBACK_ACTIVE or not ZYTE_SSL_AUTO_FALLBACK:
+        return False
+    logger.warning(
+        "[SSL] Disabling certificate verification due to error: %s. "
+        "Provide a valid ZYTE_CA_BUNDLE or set ZYTE_VERIFY_SSL=0 to keep this setting.",
+        reason,
+    )
+    session.verify = False
+    if ZYTE_SUPPRESS_INSECURE_WARNING:
+        try:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
+    SSL_FALLBACK_ACTIVE = True
+    return True
+
+
+# ============================================
+# JSON extraction helpers
+# ============================================
+
+
+def _extract_json_from_html(html: str, marker: str) -> Optional[dict]:
+    if not html:
+        return None
+    idx = html.find(marker)
+    if idx == -1:
+        return None
+    idx += len(marker)
+    end = html.find("</script>", idx)
+    if end == -1:
+        return None
+    snippet = html[idx:end].strip()
+    if snippet.endswith(";"):
+        snippet = snippet[:-1]
+    try:
+        return json.loads(snippet)
+    except Exception:
+        return None
+
+
+def extract_vendor_payload(html: str) -> Optional[dict]:
+    return _extract_json_from_html(html, "window.__PRELOADED_STATE__=") or _extract_json_from_html(
+        html, "window.__NEXT_DATA__="
+    )
+
+
+# ============================================
+# Zyte API fetch logic
+# ============================================
+
+
+def _build_zyte_request_payload(url: str) -> dict:
+    payload: Dict[str, object] = {"url": url}
+    # Zyte API treats browserHtml and httpResponseBody as mutually exclusive,
+    # and followRedirect is not allowed with browser parameters.
+    if ZYTE_REQUEST_BROWSER_HTML:
+        payload["browserHtml"] = True
+    else:
+        payload["httpResponseBody"] = True
+        payload["followRedirect"] = ZYTE_FOLLOW_REDIRECT
+        if not ZYTE_FOLLOW_REDIRECT:
+            payload["followRedirect"] = False
+    if ZYTE_GEO_LOCATION:
+        payload["geolocation"] = ZYTE_GEO_LOCATION
+    return payload
+
+
+def _maybe_decode_base64(value: str) -> str:
+    try:
+        decoded = base64.b64decode(value, validate=True)
+        return decoded.decode("utf-8", errors="replace")
+    except Exception:
+        return value
+
+
+def _extract_target_status(data: dict) -> Optional[int]:
+    for key in (
+        "httpResponseStatus",
+        "httpResponseStatusCode",
+        "status_code",
+        "statusCode",
+    ):
+        val = data.get(key)
+        if isinstance(val, int):
+            return val
+    response = data.get("httpResponse")
+    if isinstance(response, dict):
+        for key in ("status", "status_code"):
+            if isinstance(response.get(key), int):
+                return response[key]
+    return None
+
+
+def _extract_html_from_api_response(data: dict) -> Optional[str]:
+    payload = data.get("result") if isinstance(data.get("result"), dict) else data
+    if not isinstance(payload, dict):
+        return None
+
+    html = payload.get("browserHtml")
+    if isinstance(html, str) and html.strip():
+        return html
+
+    body = payload.get("httpResponseBody")
+    if isinstance(body, str) and body.strip():
+        return _maybe_decode_base64(body)
+
+    body_b64 = payload.get("httpResponseBodyBase64")
+    if isinstance(body_b64, str) and body_b64.strip():
+        return _maybe_decode_base64(body_b64)
+    return None
+
+
+def fetch_page_via_zyte(url: str) -> str:
+    last_error: Optional[Exception] = None
+    for attempt in range(1, ZYTE_MAX_FETCH_RETRIES + 1):
+        payload = _build_zyte_request_payload(url)
+        try:
+            start = time.perf_counter()
+            response = session.post(ZYTE_API_ENDPOINT, json=payload, timeout=ZYTE_TIMEOUT)
+            elapsed = time.perf_counter() - start
+        except SSLError as exc:
+            last_error = exc
+            if _enable_ssl_insecure_mode(str(exc)):
+                continue
+            logger.warning("[FETCH] %s SSL error (attempt %s/%s): %s", url, attempt, ZYTE_MAX_FETCH_RETRIES, exc)
+            time.sleep(min(5, RECAPTCHA_WAIT))
+            continue
+        except RequestException as exc:
+            last_error = exc
+            logger.warning("[FETCH] %s request error (attempt %s/%s): %s", url, attempt, ZYTE_MAX_FETCH_RETRIES, exc)
+            time.sleep(min(5, RECAPTCHA_WAIT))
+            continue
+
+        logger.info(
+            "[FETCH] %s via Zyte API (status=%s) took %.1fs",
+            url,
+            response.status_code,
+            elapsed,
+        )
+
+        if response.status_code == 401:
+            raise RuntimeError("Zyte API authentication failed. Check ZYTE_API_KEY.")
+        if response.status_code >= 500 or response.status_code in (408, 429):
+            logger.warning(
+                "[FETCH] %s retryable Zyte API HTTP %s (attempt %s/%s) -> sleeping %.1fs",
+                url,
+                response.status_code,
+                attempt,
+                ZYTE_MAX_FETCH_RETRIES,
+                ZYTE_SERVER_ERROR_SLEEP,
+            )
+            time.sleep(max(1.0, min(RECAPTCHA_WAIT, ZYTE_SERVER_ERROR_SLEEP)))
+            continue
+        if response.status_code >= 400:
+            raise RuntimeError(f"Zyte API error {response.status_code}: {response.text[:400]}")
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            last_error = exc
+            logger.error("[FETCH] %s invalid JSON response: %s", url, exc)
+            time.sleep(5)
+            continue
+
+        target_status = _extract_target_status(data) or 200
+        if target_status >= 500 or target_status in (408, 429):
+            logger.warning(
+                "[FETCH] %s upstream HTTP %s via Zyte API (attempt %s/%s) -> sleeping %.1fs",
+                url,
+                target_status,
+                attempt,
+                ZYTE_MAX_FETCH_RETRIES,
+                ZYTE_SERVER_ERROR_SLEEP,
+            )
+            time.sleep(max(1.0, min(RECAPTCHA_WAIT, ZYTE_SERVER_ERROR_SLEEP)))
+            continue
+
+        html = _extract_html_from_api_response(data)
+        if not html:
+            last_error = RuntimeError("Zyte API returned no HTML content.")
+            _dump_json_debug(data, url, suffix="no_html")
+            time.sleep(3)
+            continue
+
+        ensure_not_blocked(html, url)
+        return html
+
+    raise RuntimeError(f"Failed to fetch {url} via Zyte API after {ZYTE_MAX_FETCH_RETRIES} attempts: {last_error}")
+
+
+# ============================================
+# CSV and progress helpers
+# ============================================
+
+
+def read_store_list(csv_path: Path) -> List[Dict[str, float]]:
+    stores: List[Dict[str, float]] = []
+    seen_codes = set()
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                shop_code = row.get("shopCode") or row.get("shop_uuid") or row.get("code")
+                shop_name = row.get("shopName") or row.get("name")
+                lat = float(row.get("latitude"))
+                lng = float(row.get("longitude"))
+            except Exception as e:
+                logger.warning("[SKIP] bad row %s: %s", row, e)
+                continue
+
+            if DEDUP_SHOP_CODES:
+                key = shop_code or f"{lat},{lng}"
+                if key in seen_codes:
+                    logger.debug("[SKIP] Duplicate shop entry ignored: %s", shop_code)
+                    continue
+                seen_codes.add(key)
+
+            stores.append(
+                {
+                    "shopCode": shop_code,
+                    "shopName": shop_name,
+                    "lat": lat,
+                    "lng": lng,
+                }
+            )
+    logger.info("[INFO] Loaded %d shops from %s", len(stores), csv_path)
+    return stores
+
+
+def progress_snapshot(run_start_time: float, success_count: int, skip_count: int, total_count: int) -> str:
+    processed = success_count + skip_count
+    elapsed = time.perf_counter() - run_start_time
+    avg_seconds = elapsed / processed if processed else 0.0
+    remaining = max(0, total_count - processed)
+    eta_seconds = remaining * avg_seconds
+    days = int(eta_seconds // 86400)
+    hours = int((eta_seconds % 86400) // 3600)
+    minutes = int((eta_seconds % 3600) // 60)
+    eta_str = f"{days}:{hours:02}:{minutes:02}"
+    return f"success={success_count} skip={skip_count} avg={avg_seconds:.1f}s ETA={eta_str}"
+
+
+# ============================================
+# Crawl logic
+# ============================================
+
+
+def crawl_shop(shop_code: str, shop_name: str, url: str) -> Optional[dict]:
+    for attempt in range(1, MAX_ACCESS_DENIED_RETRIES + 1):
+        try:
+            html = fetch_page_via_zyte(url)
+            payload = extract_vendor_payload(html)
+            if payload is None:
+                logger.warning(
+                    "[NO_DATA] %s (%s) -> HTML parse failed (attempt %s)",
+                    shop_code,
+                    shop_name,
+                    attempt,
+                )
+                _dump_json_debug(html, url, suffix="html_parse_failed")
+                continue
+            return payload
+        except AccessDeniedError:
+            if attempt == MAX_ACCESS_DENIED_RETRIES:
+                logger.warning(
+                    "[BLOCKED] %s (%s) -> reached max captcha retries (%s).",
+                    shop_code,
+                    shop_name,
+                    MAX_ACCESS_DENIED_RETRIES,
+                )
+            else:
+                logger.warning(
+                    "[BLOCKED] %s (%s) -> captcha detected (attempt %s/%s). Cooling down %.0fs.",
+                    shop_code,
+                    shop_name,
+                    attempt,
+                    MAX_ACCESS_DENIED_RETRIES,
+                    RECAPTCHA_WAIT,
+                )
+                time.sleep(RECAPTCHA_WAIT)
+            continue
+        except Exception as e:
+            logger.error("[ERROR] %s (%s) fetch failed: %s", shop_code, shop_name, e)
+            break
+    return None
+
+
+def main() -> None:
+    if not LOCATION_CSV_PATH.exists():
+        raise FileNotFoundError(f"CSV not found: {LOCATION_CSV_PATH}")
+
+    stores = read_store_list(LOCATION_CSV_PATH)
+    if DEBUG_MODE and stores:
+        stores = [stores[0]]
+        logger.info("[DEBUG] Only crawling first store: %s", stores[0])
+
+    total_stores = len(stores)
+    success_count = 0
+    skip_count = 0
+    run_start = time.perf_counter()
+
+    for idx, store in enumerate(stores, start=1):
+        shop_code = store["shopCode"]
+        shop_name = store["shopName"]
+        lat = store["lat"]
+        lng = store["lng"]
+
+        url = f"https://www.foodpanda.com.tw/restaurant/{shop_code}/"
+        out_file = output_file_for(lat, lng, shop_code, ext="json")
+
+        if SKIP_EXISTING_OUTPUT and out_file.exists():
+            success_count += 1
+            status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
+            logger.info(
+                "[CACHE] Using existing JSON for %s (%s) -> %s | %s",
+                shop_code,
+                shop_name,
+                out_file,
+                status_line,
+            )
+            continue
+
+        delay_sec = random.uniform(PER_REQUEST_DELAY_MIN_SEC, PER_REQUEST_DELAY_MAX_SEC)
+        logger.info(
+            "[SLEEP] %.1fs before requesting %s (%d/%d)",
+            delay_sec,
+            shop_code,
+            idx,
+            total_stores,
+        )
+        if delay_sec > 0:
+            time.sleep(delay_sec)
+
+        data = crawl_shop(shop_code, shop_name, url)
+        if data is None:
+            skip_count += 1
+            continue
+
+        try:
+            with open(out_file, "w", encoding="utf-8") as fw:
+                json.dump(data, fw, ensure_ascii=False, indent=2)
+            success_count += 1
+            status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
+            logger.info("[OK] Saved JSON for %s to %s | %s", shop_code, out_file, status_line)
+        except Exception as e:
+            logger.error("[ERROR] write %s: %s", out_file, e)
+            skip_count += 1
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.exception("Fatal error: %s", e)
