@@ -11,12 +11,14 @@ helpers stay untouched so downstream payloads remain identical.
 
 import base64
 import certifi
+import concurrent.futures
 import csv
 import json
 import logging
 import os
 import random
 import re
+import threading
 import time
 from datetime import datetime
 from html import unescape
@@ -45,6 +47,7 @@ class AccessDeniedError(RuntimeError):
 DEBUG_MODE = False
 PER_REQUEST_DELAY_MIN_SEC = float(os.environ.get("PANDA_DELAY_MIN", "0"))
 PER_REQUEST_DELAY_MAX_SEC = float(os.environ.get("PANDA_DELAY_MAX", "0"))
+PANDA_WORKERS = max(1, int(os.environ.get("PANDA_WORKERS", "8")))
 CRAWL_HTML_ONLY = True
 
 RECAPTCHA_WAIT = int(os.environ.get("RECAPTCHA_WAIT", "60"))
@@ -181,6 +184,32 @@ logger.info(
     ZYTE_VENDOR_API_FALLBACK,
     ZYTE_SKIP_VENDOR_API_FALLBACK,
 )
+logger.info("[CONFIG] workers=%s delay=%.2f..%.2fs", PANDA_WORKERS, PER_REQUEST_DELAY_MIN_SEC, PER_REQUEST_DELAY_MAX_SEC)
+
+# NOTE: requests.Session is not guaranteed thread-safe. When running with
+# concurrency, use a per-thread Session that tracks the current global verify
+# setting (which may switch to insecure mode after SSL errors).
+_THREAD_LOCAL = threading.local()
+_VERIFY_LOCK = threading.Lock()
+SESSION_VERIFY = session.verify
+
+
+def _new_session() -> requests.Session:
+    s = requests.Session()
+    s.auth = (ZYTE_API_KEY, "")
+    s.headers.update({"Content-Type": "application/json"})
+    s.verify = SESSION_VERIFY
+    return s
+
+
+def _get_session() -> requests.Session:
+    current = getattr(_THREAD_LOCAL, "session", None)
+    current_verify = getattr(_THREAD_LOCAL, "verify", None)
+    if current is None or current_verify != SESSION_VERIFY:
+        current = _new_session()
+        _THREAD_LOCAL.session = current
+        _THREAD_LOCAL.verify = SESSION_VERIFY
+    return current
 
 
 # ============================================
@@ -255,21 +284,25 @@ def ensure_not_blocked(page_source: str, url: str) -> None:
 def _enable_ssl_insecure_mode(reason: str) -> bool:
     """Disable certificate verification mid-run if allowed."""
     global SSL_FALLBACK_ACTIVE
+    global SESSION_VERIFY
     if SSL_FALLBACK_ACTIVE or not ZYTE_SSL_AUTO_FALLBACK:
         return False
-    logger.warning(
-        "[SSL] Disabling certificate verification due to error: %s. "
-        "Provide a valid ZYTE_CA_BUNDLE or set ZYTE_VERIFY_SSL=0 to keep this setting.",
-        reason,
-    )
-    session.verify = False
-    if ZYTE_SUPPRESS_INSECURE_WARNING:
-        try:
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        except Exception:
-            pass
-    SSL_FALLBACK_ACTIVE = True
-    return True
+    with _VERIFY_LOCK:
+        if SSL_FALLBACK_ACTIVE:
+            return False
+        logger.warning(
+            "[SSL] Disabling certificate verification due to error: %s. "
+            "Provide a valid ZYTE_CA_BUNDLE or set ZYTE_VERIFY_SSL=0 to keep this setting.",
+            reason,
+        )
+        SESSION_VERIFY = False
+        if ZYTE_SUPPRESS_INSECURE_WARNING:
+            try:
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            except Exception:
+                pass
+        SSL_FALLBACK_ACTIVE = True
+        return True
 
 
 # ============================================
@@ -712,7 +745,7 @@ def fetch_page_via_zyte(url: str) -> str:
         payload = _build_zyte_request_payload(url)
         try:
             start = time.perf_counter()
-            response = session.post(ZYTE_API_ENDPOINT, json=payload, timeout=ZYTE_TIMEOUT)
+            response = _get_session().post(ZYTE_API_ENDPOINT, json=payload, timeout=ZYTE_TIMEOUT)
             elapsed = time.perf_counter() - start
         except SSLError as exc:
             last_error = exc
@@ -923,7 +956,7 @@ def main() -> None:
     skip_count = 0
     run_start = time.perf_counter()
 
-    for idx, store in enumerate(stores, start=1):
+    def _process_store(store: Dict[str, float]) -> str:
         shop_code = store["shopCode"]
         shop_name = store["shopName"]
         lat = store["lat"]
@@ -933,42 +966,73 @@ def main() -> None:
         out_file = output_file_for(lat, lng, shop_code, ext="json")
 
         if SKIP_EXISTING_OUTPUT and out_file.exists():
-            success_count += 1
-            status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
-            logger.info(
-                "[CACHE] Using existing JSON for %s (%s) -> %s | %s",
-                shop_code,
-                shop_name,
-                out_file,
-                status_line,
-            )
-            continue
+            return "cache"
 
         delay_sec = random.uniform(PER_REQUEST_DELAY_MIN_SEC, PER_REQUEST_DELAY_MAX_SEC)
-        logger.info(
-            "[SLEEP] %.1fs before requesting %s (%d/%d)",
-            delay_sec,
-            shop_code,
-            idx,
-            total_stores,
-        )
         if delay_sec > 0:
             time.sleep(delay_sec)
 
         data = crawl_shop(shop_code, shop_name, url)
         if data is None:
-            skip_count += 1
-            continue
+            return "fail"
 
         try:
             with open(out_file, "w", encoding="utf-8") as fw:
                 json.dump(data, fw, ensure_ascii=False, indent=2)
-            success_count += 1
-            status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
-            logger.info("[OK] Saved JSON for %s to %s | %s", shop_code, out_file, status_line)
+            return "ok"
         except Exception as e:
             logger.error("[ERROR] write %s: %s", out_file, e)
-            skip_count += 1
+            return "fail"
+
+    if PANDA_WORKERS <= 1:
+        for store in stores:
+            shop_code = store["shopCode"]
+            shop_name = store["shopName"]
+            lat = store["lat"]
+            lng = store["lng"]
+            out_file = output_file_for(lat, lng, shop_code, ext="json")
+
+            result = _process_store(store)
+            if result == "cache":
+                success_count += 1
+                status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
+                logger.info("[CACHE] Using existing JSON for %s (%s) -> %s | %s", shop_code, shop_name, out_file, status_line)
+            elif result == "ok":
+                success_count += 1
+                status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
+                logger.info("[OK] Saved JSON for %s to %s | %s", shop_code, out_file, status_line)
+            else:
+                skip_count += 1
+        return
+
+    logger.info("[INFO] Running with %d workers (concurrent)", PANDA_WORKERS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=PANDA_WORKERS) as executor:
+        future_to_store = {executor.submit(_process_store, store): store for store in stores}
+        for future in concurrent.futures.as_completed(future_to_store):
+            store = future_to_store[future]
+            shop_code = store["shopCode"]
+            shop_name = store["shopName"]
+            lat = store["lat"]
+            lng = store["lng"]
+            out_file = output_file_for(lat, lng, shop_code, ext="json")
+            try:
+                result = future.result()
+            except Exception as exc:
+                logger.error("[ERROR] %s (%s) worker crashed: %s", shop_code, shop_name, exc)
+                result = "fail"
+
+            if result == "cache":
+                success_count += 1
+                status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
+                logger.info("[CACHE] Using existing JSON for %s (%s) -> %s | %s", shop_code, shop_name, out_file, status_line)
+            elif result == "ok":
+                success_count += 1
+                status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
+                logger.info("[OK] Saved JSON for %s to %s | %s", shop_code, out_file, status_line)
+            else:
+                skip_count += 1
+                status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
+                logger.info("[SKIP] %s (%s) failed | %s", shop_code, shop_name, status_line)
 
 
 if __name__ == "__main__":
