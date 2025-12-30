@@ -10,8 +10,10 @@ import argparse
 import json
 import logging
 import re
+from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -35,6 +37,12 @@ def _dump_json(path: Optional[Path], payload: Optional[dict]) -> None:
         print(f"[OK] Saved parsed vendor JSON to {path}")
     else:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _dump_json_file(path: Path, payload: dict, label: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[OK] Saved {label} to {path}")
 
 
 def _extract_state_raw(html: str) -> Optional[str]:
@@ -66,6 +74,264 @@ def _has_menus(payload: Optional[dict]) -> bool:
         if isinstance(data, dict) and "menus" in data:
             return True
     return False
+
+
+def _parse_price_to_int(raw: Optional[str]) -> Optional[int]:
+    if not raw:
+        return None
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except Exception:
+        return None
+
+
+class _FoodpandaMenuDomParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._tag_stack: List[str] = []
+
+        self.categories: List[Dict[str, Any]] = []
+        self._category: Optional[Dict[str, Any]] = None
+        self._category_depth: Optional[int] = None
+
+        self._product: Optional[Dict[str, Any]] = None
+        self._product_depth: Optional[int] = None
+
+        self._capture_key: Optional[str] = None
+        self._capture_buf: List[str] = []
+
+    @staticmethod
+    def _attrs_to_dict(attrs: List[Tuple[str, Optional[str]]]) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for key, val in attrs:
+            if key and val is not None:
+                out[key] = val
+        return out
+
+    def _start_capture(self, key: str) -> None:
+        if self._capture_key and self._capture_key != key:
+            self._finish_capture()
+        self._capture_key = key
+        self._capture_buf = []
+
+    def _finish_capture(self) -> None:
+        if not self._capture_key:
+            return
+        key = self._capture_key
+        text = unescape("".join(self._capture_buf)).strip()
+        self._capture_key = None
+        self._capture_buf = []
+        if not text:
+            return
+        if self._product is not None:
+            if self._product.get(key):
+                return
+            self._product[key] = text
+        elif self._category is not None:
+            if self._category.get(key):
+                return
+            self._category[key] = text
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        self._tag_stack.append(tag)
+        attr_map = self._attrs_to_dict(attrs)
+        test_id = attr_map.get("data-testid")
+
+        if tag == "div" and test_id == "menu-category-section":
+            self._category = {
+                "id": attr_map.get("id"),
+                "name": None,
+                "description": None,
+                "products": [],
+            }
+            self._category_depth = len(self._tag_stack)
+            return
+
+        if self._category is None:
+            return
+
+        if tag == "h2" and "dish-category-title" in (attr_map.get("class") or ""):
+            self._start_capture("name")
+            return
+
+        if test_id == "menu-category-section-description":
+            self._start_capture("description")
+            return
+
+        if tag == "li" and test_id == "menu-product":
+            self._product = {
+                "id": None,
+                "name": None,
+                "description": None,
+                "price": None,
+                "price_before_discount": None,
+            }
+            self._product_depth = len(self._tag_stack)
+            self._category["products"].append(self._product)
+            return
+
+        if self._product is None:
+            return
+
+        if test_id == "menu-quantity-stepper":
+            raw_id = attr_map.get("id", "")
+            # Example: quantity-stepper-0-142032330
+            if raw_id.startswith("quantity-stepper-"):
+                parts = raw_id.split("-")
+                if parts and parts[-1].isdigit():
+                    self._product["id"] = int(parts[-1])
+            return
+
+        if test_id == "menu-product-name":
+            self._start_capture("name")
+            return
+
+        if test_id == "menu-product-description":
+            self._start_capture("description")
+            return
+
+        if test_id == "menu-product-price":
+            self._start_capture("price")
+            return
+
+        if test_id == "menu-product-price-before-discount":
+            self._start_capture("price_before_discount")
+            return
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._capture_key:
+            self._finish_capture()
+
+        if self._tag_stack:
+            self._tag_stack.pop()
+
+        if self._product is not None and self._product_depth is not None and len(self._tag_stack) < self._product_depth:
+            if isinstance(self._product.get("price"), str):
+                self._product["price_value"] = _parse_price_to_int(self._product.get("price"))
+            if isinstance(self._product.get("price_before_discount"), str):
+                self._product["price_before_discount_value"] = _parse_price_to_int(
+                    self._product.get("price_before_discount")
+                )
+            self._product = None
+            self._product_depth = None
+
+        if self._category is not None and self._category_depth is not None and len(self._tag_stack) < self._category_depth:
+            self.categories.append(self._category)
+            self._category = None
+            self._category_depth = None
+
+    def handle_data(self, data: str) -> None:
+        if not self._capture_key:
+            return
+        if data and data.strip():
+            self._capture_buf.append(data)
+
+
+def extract_dom_menu_categories(html: str) -> Optional[List[Dict[str, Any]]]:
+    if not html:
+        return None
+    parser = _FoodpandaMenuDomParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        return None
+
+    categories = [c for c in parser.categories if c.get("name") or c.get("products")]
+    return categories or None
+
+
+def _dom_categories_to_panda_menus(categories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Convert rendered DOM categories into a structure that panda_menu_postprocess.py can consume.
+
+    Target shape: {"menus":[{"menu_categories":[{"products":[{"product_variations":[...]}]}]}]}
+    """
+    menu_categories: List[Dict[str, Any]] = []
+    for cat in categories:
+        cat_name = cat.get("name")
+        if not cat_name:
+            continue
+
+        products_out: List[Dict[str, Any]] = []
+        for p in cat.get("products") or []:
+            if not isinstance(p, dict):
+                continue
+            name = p.get("name")
+            if not name:
+                continue
+            pid = p.get("id")
+            pid_int = pid if isinstance(pid, int) else None
+            code = str(pid_int) if pid_int is not None else None
+            price_val = p.get("price_value") if isinstance(p.get("price_value"), int) else _parse_price_to_int(p.get("price"))
+            pre_val = (
+                p.get("price_before_discount_value")
+                if isinstance(p.get("price_before_discount_value"), int)
+                else _parse_price_to_int(p.get("price_before_discount"))
+            )
+
+            products_out.append(
+                {
+                    "id": pid_int,
+                    "code": code,
+                    "name": name,
+                    "description": p.get("description"),
+                    "is_sold_out": False,
+                    "tags": [],
+                    "price": price_val,
+                    "price_before_discount": pre_val,
+                    "product_variations": [
+                        {
+                            "code": code,
+                            "name": None,
+                            "price": price_val,
+                            "price_before_discount": pre_val,
+                        }
+                    ],
+                }
+            )
+
+        if not products_out:
+            continue
+
+        menu_categories.append(
+            {
+                "id": None,
+                "name": cat_name,
+                "description": cat.get("description"),
+                "products": products_out,
+            }
+        )
+
+    if not menu_categories:
+        return []
+    return [{"menu_categories": menu_categories}]
+
+
+def _merge_menus_for_postprocess(payload: dict, menus: List[Dict[str, Any]]) -> bool:
+    """
+    Ensure menus appear in the dict returned by panda_menu_postprocess.load_response_json().
+
+    That function prioritizes `raw["vendor"]["data"]` when present, so we attach
+    menus under `vendor.data.menus` if possible.
+    """
+    if not menus:
+        return False
+
+    vendor_wrapper = payload.get("vendor")
+    if isinstance(vendor_wrapper, dict) and isinstance(vendor_wrapper.get("data"), dict):
+        vendor_wrapper["data"]["menus"] = menus
+        return True
+
+    if isinstance(payload.get("data"), dict):
+        payload["data"]["menus"] = menus
+        return True
+
+    payload["menus"] = menus
+    return True
 
 
 def _infer_vendor_code(payload: Optional[dict], url: str, html: str) -> Optional[str]:
@@ -163,6 +429,16 @@ def main() -> None:
         type=Path,
         help="Optional path to save raw window.__PRELOADED_STATE__ string (for debugging completeness).",
     )
+    parser.add_argument(
+        "--dom-output",
+        type=Path,
+        help="Optional path to save parsed DOM categories (for debugging).",
+    )
+    parser.add_argument(
+        "--skip-api-fallback",
+        action="store_true",
+        help="Skip vendor API fallback even if menus are missing (useful when focusing on DOM parsing).",
+    )
     args = parser.parse_args()
 
     if args.render:
@@ -190,14 +466,27 @@ def main() -> None:
     if payload is None:
         payload = extract_vendor_payload(html)
 
-    if not _has_menus(payload):
+    if args.dom_output or (args.render and not _has_menus(payload)):
+        categories = extract_dom_menu_categories(html)
+        if categories:
+            menus = _dom_categories_to_panda_menus(categories)
+            if isinstance(payload, dict) and menus:
+                merged = _merge_menus_for_postprocess(payload, menus)
+                if merged:
+                    print(f"[INFO] Menus merged from DOM: categories={len(categories)}")
+            if args.dom_output:
+                _dump_json_file(args.dom_output, {"categories": categories}, "DOM categories")
+        else:
+            print("[INFO] No menu categories found in DOM.")
+
+    if not _has_menus(payload) and not args.skip_api_fallback:
         vendor_code = _infer_vendor_code(payload, args.url, html)
         lat, lng = _infer_coords(payload, args.lat, args.lng, html)
         api_data = _fetch_menus_via_api(vendor_code, lat, lng) if vendor_code else None
         if api_data and isinstance(payload, dict):
             menus = api_data.get("data", {}).get("menus")
             if menus:
-                payload.setdefault("menu", {})["menus"] = menus
+                _merge_menus_for_postprocess(payload, menus)
                 payload.setdefault("menu_api_raw", api_data)
                 print(f"[INFO] Menus filled from vendor API for {vendor_code}.")
         elif not payload and api_data:
@@ -208,3 +497,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# python ./zyte_test.py https://foodpanda.com.tw/restaurant/njyd/a-po-mian-dian --output zyte.html --json-output zyte.json --state-output state.json --dom-output dom_menu.json --render
