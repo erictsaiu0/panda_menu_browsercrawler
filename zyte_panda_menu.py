@@ -962,6 +962,12 @@ def parse_args() -> argparse.Namespace:
         help="Enable item parsing (forces browser rendering to fetch full menus).",
     )
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of worker threads (default: 1).",
+    )
+    parser.add_argument(
         "--parse-part",
         choices=["A", "B"],
         help="Split rolling.csv into two halves when item parsing (A or B).",
@@ -974,6 +980,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    global PANDA_WORKERS
+    PANDA_WORKERS = max(1, args.num_workers)
 
     if args.item_parse:
         warn_msg = "[WARN] item_parse enabled -> forcing browser rendering for full menu items."
@@ -1100,6 +1109,6 @@ if __name__ == "__main__":
 # without menu item parsing:
 #   python zyte_panda_menu.py
 # with menu item parsing, part A: (侑霖)
-#   python zyte_panda_menu.py --item-parse --parse-part A
+#   python zyte_panda_menu.py --item-parse --parse-part A --num-workers 16
 # with menu item parsing, part B: (友承)
-#   python zyte_panda_menu.py --item-parse --parse-part B
+#   python zyte_panda_menu.py --item-parse --parse-part B --num-workers 16
