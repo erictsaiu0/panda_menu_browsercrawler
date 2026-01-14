@@ -9,6 +9,7 @@ REST API to fetch/render each restaurant page server-side. The JSON extraction
 helpers stay untouched so downstream payloads remain identical.
 """
 
+import argparse
 import base64
 import certifi
 import concurrent.futures
@@ -47,7 +48,7 @@ class AccessDeniedError(RuntimeError):
 DEBUG_MODE = False
 PER_REQUEST_DELAY_MIN_SEC = float(os.environ.get("PANDA_DELAY_MIN", "0"))
 PER_REQUEST_DELAY_MAX_SEC = float(os.environ.get("PANDA_DELAY_MAX", "0"))
-PANDA_WORKERS = max(1, int(os.environ.get("PANDA_WORKERS", "8")))
+PANDA_WORKERS = max(1, int(os.environ.get("PANDA_WORKERS", "1")))
 CRAWL_HTML_ONLY = True
 
 RECAPTCHA_WAIT = int(os.environ.get("RECAPTCHA_WAIT", "60"))
@@ -60,9 +61,9 @@ DEDUP_SHOP_CODES = os.environ.get("PANDA_DEDUP_SHOPS", "1") not in ("0", "false"
 # ============================================
 
 BASE_DIR = Path(__file__).resolve().parent
-LOCATION_CSV_PATH = BASE_DIR / "panda_data" / "shopLst" / "rolling.csv"
+LOCATION_CSV_PATH = Path("../panda_data") / "shopLst" / "rolling.csv"
 TODAY = datetime.now().strftime("%Y-%m-%d")
-OUTPUT_BASE = BASE_DIR / "panda_data_py" / "panda_menu"
+OUTPUT_BASE = Path("../panda_data_js") / "panda_menu"
 OUTPUT_DIR = OUTPUT_BASE / TODAY
 LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / f"{TODAY}.log"
@@ -103,11 +104,11 @@ ZYTE_SSL_AUTO_FALLBACK = os.environ.get("ZYTE_SSL_AUTO_FALLBACK", "1") not in ("
 ZYTE_SUPPRESS_INSECURE_WARNING = (
     os.environ.get("ZYTE_SUPPRESS_INSECURE_WARNING", "1") not in ("0", "false", "False")
 )
-ZYTE_REQUEST_BROWSER_HTML = os.environ.get("ZYTE_BROWSER_HTML", "1") not in ("0", "false", "False")
-ZYTE_DOM_MENUS = os.environ.get("ZYTE_DOM_MENUS", "1") not in ("0", "false", "False")
+ZYTE_REQUEST_BROWSER_HTML = os.environ.get("ZYTE_BROWSER_HTML", "0") not in ("0", "false", "False")
+ZYTE_DOM_MENUS = os.environ.get("ZYTE_DOM_MENUS", "0") not in ("0", "false", "False")
 ZYTE_VENDOR_API_FALLBACK = os.environ.get("ZYTE_VENDOR_API_FALLBACK", "0") not in ("0", "false", "False")
 ZYTE_SKIP_VENDOR_API_FALLBACK = os.environ.get("ZYTE_SKIP_VENDOR_API_FALLBACK", "1") not in ("0", "false", "False")
-DEFAULT_ZYTE_CA_PATH = BASE_DIR / "zyte-ca.crt"
+DEFAULT_ZYTE_CA_PATH = BASE_DIR / "zyte-ca-982.crt"
 if not ZYTE_CA_BUNDLE and DEFAULT_ZYTE_CA_PATH.exists():
     ZYTE_CA_BUNDLE = str(DEFAULT_ZYTE_CA_PATH)
 
@@ -117,6 +118,13 @@ def set_browser_rendering(enabled: bool) -> None:
     global ZYTE_REQUEST_BROWSER_HTML
     ZYTE_REQUEST_BROWSER_HTML = enabled
     logger.info("[CONFIG] Zyte browserHtml rendering = %s", enabled)
+
+
+def set_dom_menus(enabled: bool) -> None:
+    """Toggle DOM menu extraction at runtime."""
+    global ZYTE_DOM_MENUS
+    ZYTE_DOM_MENUS = enabled
+    logger.info("[CONFIG] DOM menu extraction = %s", enabled)
 
 
 def _compose_verify_bundle() -> Optional[str]:
@@ -231,18 +239,20 @@ def _dump_access_denied_html(page_source: str, url: str) -> Path:
     suffix = url.rstrip("/").split("/")[-1] or "homepage"
     dump_path = LOG_DIR / f"access_denied_{suffix}_{timestamp}.html"
     try:
-        dump_path.write_text(page_source, encoding="utf-8")
-        logger.error(
-            "[BLOCKED] Access denied / captcha detected for %s. Dumped HTML to %s",
-            url,
-            dump_path,
-        )
+        # dump_path.write_text(page_source, encoding="utf-8")
+        # logger.error(
+        #     "[BLOCKED] Access denied / captcha detected for %s. Dumped HTML to %s",
+        #     url,
+        #     dump_path,
+        # )
+        pass
     except Exception as dump_err:
-        logger.error(
-            "[BLOCKED] Access denied for %s, but failed to dump HTML: %s",
-            url,
-            dump_err,
-        )
+        # logger.error(
+        #     "[BLOCKED] Access denied for %s, but failed to dump HTML: %s",
+        #     url,
+        #     dump_err,
+        # )
+        pass
     return dump_path
 
 
@@ -251,13 +261,15 @@ def _dump_json_debug(payload: str, url: str, suffix: str = "debug") -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         slug = url.rstrip("/").split("/")[-1] or "homepage"
         out = LOG_DIR / f"json_{slug}_{suffix}_{timestamp}.txt"
-        out.write_text(
-            payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        logger.info("[DEBUG] Dumped JSON payload for %s to %s", url, out)
+        # out.write_text(
+        #     payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False),
+        #     encoding="utf-8",
+        # )
+        # logger.info("[DEBUG] Dumped JSON payload for %s to %s", url, out)
+        pass
     except Exception as e:
-        logger.warning("[DEBUG] Failed to dump JSON payload for %s: %s", url, e)
+        # logger.warning("[DEBUG] Failed to dump JSON payload for %s: %s", url, e)
+        pass
 
 
 def is_access_denied(page_source: str) -> bool:
@@ -942,11 +954,53 @@ def crawl_shop(shop_code: str, shop_name: str, url: str) -> Optional[dict]:
     return None
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Foodpanda menu crawler (Zyte API).")
+    parser.add_argument(
+        "--item-parse",
+        action="store_true",
+        help="Enable item parsing (forces browser rendering to fetch full menus).",
+    )
+    parser.add_argument(
+        "--parse-part",
+        choices=["A", "B"],
+        help="Split rolling.csv into two halves when item parsing (A or B).",
+    )
+    args = parser.parse_args()
+    if args.parse_part and not args.item_parse:
+        parser.error("--parse-part is only valid when --item-parse is enabled.")
+    return args
+
+
 def main() -> None:
+    args = parse_args()
+
+    if args.item_parse:
+        warn_msg = "[WARN] item_parse enabled -> forcing browser rendering for full menu items."
+        print(warn_msg)
+        logger.warning(warn_msg)
+        if not ZYTE_REQUEST_BROWSER_HTML:
+            set_browser_rendering(True)
+        if not ZYTE_DOM_MENUS:
+            set_dom_menus(True)
+    else:
+        if ZYTE_DOM_MENUS:
+            set_dom_menus(False)
+
     if not LOCATION_CSV_PATH.exists():
         raise FileNotFoundError(f"CSV not found: {LOCATION_CSV_PATH}")
 
     stores = read_store_list(LOCATION_CSV_PATH)
+    if args.item_parse and args.parse_part:
+        target_mod = 0 if args.parse_part == "A" else 1
+        total_before = len(stores)
+        stores = [store for idx, store in enumerate(stores) if idx % 2 == target_mod]
+        logger.info(
+            "[INFO] item_parse parse_part=%s -> processing %d/%d shops",
+            args.parse_part,
+            len(stores),
+            total_before,
+        )
     if DEBUG_MODE and stores:
         stores = [stores[0]]
         logger.info("[DEBUG] Only crawling first store: %s", stores[0])
@@ -1040,3 +1094,12 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         logger.exception("Fatal error: %s", e)
+
+
+# example usage:
+# without menu item parsing:
+#   python zyte_panda_menu.py
+# with menu item parsing, part A: (侑霖)
+#   python zyte_panda_menu.py --item-parse --parse-part A
+# with menu item parsing, part B: (友承)
+#   python zyte_panda_menu.py --item-parse --parse-part B
