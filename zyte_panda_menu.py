@@ -26,6 +26,7 @@ from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import dotenv
 import requests
@@ -55,6 +56,9 @@ RECAPTCHA_WAIT = int(os.environ.get("RECAPTCHA_WAIT", "60"))
 MAX_ACCESS_DENIED_RETRIES = int(os.environ.get("MAX_ACCESS_DENIED_RETRIES", "2"))
 SKIP_EXISTING_OUTPUT = os.environ.get("PANDA_SKIP_EXISTING", "1") not in ("0", "false", "False")
 DEDUP_SHOP_CODES = os.environ.get("PANDA_DEDUP_SHOPS", "1") not in ("0", "false", "False")
+DEFAULT_OPENING_TYPE = os.environ.get("PANDA_OPENING_TYPE", "delivery").strip().lower() or "delivery"
+if DEFAULT_OPENING_TYPE not in {"delivery", "pickup", "both"}:
+    DEFAULT_OPENING_TYPE = "delivery"
 
 # ============================================
 # Path & logging setup
@@ -230,8 +234,23 @@ ACCESS_DENIED_MARKERS = (
 )
 
 
-def output_file_for(lat: float, lng: float, shop_code: str, ext: str = "json") -> Path:
-    return OUTPUT_DIR / f"{lat}_{lng}_{shop_code}.{ext}"
+def output_file_for(lat: float, lng: float, shop_code: str, opening_type: str = "delivery", ext: str = "json") -> Path:
+    suffix = "" if opening_type == "delivery" else f"_{opening_type}"
+    return OUTPUT_DIR / f"{lat}_{lng}_{shop_code}{suffix}.{ext}"
+
+
+def build_restaurant_url(shop_code: str, opening_type: str, redirection_url: Optional[str] = None) -> str:
+    base_url = (redirection_url or "").strip() or f"https://www.foodpanda.com.tw/restaurant/{shop_code}"
+    parts = urlsplit(base_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["opening_type"] = opening_type
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def resolve_opening_types(opening_type: str) -> List[str]:
+    if opening_type == "both":
+        return ["delivery", "pickup"]
+    return [opening_type]
 
 
 def _dump_access_denied_html(page_source: str, url: str) -> Path:
@@ -657,12 +676,17 @@ def _infer_coords(payload: Optional[dict], html: str) -> Tuple[Optional[float], 
     return None, None
 
 
-def _fetch_menus_via_api(vendor_code: str, lat: Optional[float], lng: Optional[float]) -> Optional[List[Dict[str, Any]]]:
+def _fetch_menus_via_api(
+    vendor_code: str,
+    lat: Optional[float],
+    lng: Optional[float],
+    opening_type: str = "delivery",
+) -> Optional[List[Dict[str, Any]]]:
     base_url = f"https://tw.fd-api.com/api/v5/vendors/{vendor_code}"
     params: Dict[str, object] = {
         "include": "menus,bundles,multiple_discounts",
         "language_id": "6",
-        "opening_type": "delivery",
+        "opening_type": opening_type,
         "basket_currency": "TWD",
     }
     if lat is not None and lng is not None:
@@ -860,6 +884,7 @@ def read_store_list(csv_path: Path) -> List[Dict[str, float]]:
                 {
                     "shopCode": shop_code,
                     "shopName": shop_name,
+                    "redirection_url": row.get("redirection_url"),
                     "lat": lat,
                     "lng": lng,
                 }
@@ -886,7 +911,7 @@ def progress_snapshot(run_start_time: float, success_count: int, skip_count: int
 # ============================================
 
 
-def crawl_shop(shop_code: str, shop_name: str, url: str) -> Optional[dict]:
+def crawl_shop(shop_code: str, shop_name: str, url: str, opening_type: str = "delivery") -> Optional[dict]:
     for attempt in range(1, MAX_ACCESS_DENIED_RETRIES + 1):
         try:
             html = fetch_page_via_zyte(url)
@@ -918,14 +943,15 @@ def crawl_shop(shop_code: str, shop_name: str, url: str) -> Optional[dict]:
                     vendor_code = _infer_vendor_code(payload, url, html)
                     lat, lng = _infer_coords(payload, html)
                     if vendor_code:
-                        menus = _fetch_menus_via_api(vendor_code, lat, lng)
+                        menus = _fetch_menus_via_api(vendor_code, lat, lng, opening_type=opening_type)
                         if menus:
                             _merge_menus_for_postprocess(payload, menus)
                             logger.info(
-                                "[MENU_API] %s (%s) merged menus from vendor API (%s)",
+                                "[MENU_API] %s (%s) merged menus from vendor API (%s, opening_type=%s)",
                                 shop_code,
                                 shop_name,
                                 vendor_code,
+                                opening_type,
                             )
 
             return payload
@@ -957,6 +983,12 @@ def crawl_shop(shop_code: str, shop_name: str, url: str) -> Optional[dict]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Foodpanda menu crawler (Zyte API).")
     parser.add_argument(
+        "--opening-type",
+        choices=["delivery", "pickup", "both"],
+        default=DEFAULT_OPENING_TYPE,
+        help="Restaurant opening type to crawl (default: delivery). Use 'both' to crawl both delivery and pickup.",
+    )
+    parser.add_argument(
         "--item-parse",
         action="store_true",
         help="Enable item parsing (forces browser rendering to fetch full menus).",
@@ -972,9 +1004,17 @@ def parse_args() -> argparse.Namespace:
         choices=["A", "B"],
         help="Split rolling.csv into two halves when item parsing (A or B).",
     )
+    parser.add_argument(
+        "--limit-for-testing",
+        type=int,
+        default=0,
+        help="Limit the number of shops for testing after any parse-part filtering (default: 0 = no limit).",
+    )
     args = parser.parse_args()
     if args.parse_part and not args.item_parse:
         parser.error("--parse-part is only valid when --item-parse is enabled.")
+    if args.limit_for_testing < 0:
+        parser.error("--limit-for-testing must be >= 0.")
     return args
 
 
@@ -1010,6 +1050,15 @@ def main() -> None:
             len(stores),
             total_before,
         )
+    if args.limit_for_testing:
+        total_before = len(stores)
+        stores = stores[: args.limit_for_testing]
+        logger.info(
+            "[INFO] limit_for_testing=%s -> processing %d/%d shops",
+            args.limit_for_testing,
+            len(stores),
+            total_before,
+        )
     if DEBUG_MODE and stores:
         stores = [stores[0]]
         logger.info("[DEBUG] Only crawling first store: %s", stores[0])
@@ -1018,15 +1067,18 @@ def main() -> None:
     success_count = 0
     skip_count = 0
     run_start = time.perf_counter()
+    opening_types = resolve_opening_types(args.opening_type)
+    total_jobs = total_stores * len(opening_types)
 
-    def _process_store(store: Dict[str, float]) -> str:
+    def _process_store(store: Dict[str, float], opening_type: str) -> str:
         shop_code = store["shopCode"]
         shop_name = store["shopName"]
+        redirection_url = store.get("redirection_url")
         lat = store["lat"]
         lng = store["lng"]
 
-        url = f"https://www.foodpanda.com.tw/restaurant/{shop_code}"
-        out_file = output_file_for(lat, lng, shop_code, ext="json")
+        url = build_restaurant_url(shop_code, opening_type, redirection_url=redirection_url)
+        out_file = output_file_for(lat, lng, shop_code, opening_type=opening_type, ext="json")
 
         if SKIP_EXISTING_OUTPUT and out_file.exists():
             return "cache"
@@ -1035,7 +1087,7 @@ def main() -> None:
         if delay_sec > 0:
             time.sleep(delay_sec)
 
-        data = crawl_shop(shop_code, shop_name, url)
+        data = crawl_shop(shop_code, shop_name, url, opening_type=opening_type)
         if data is None:
             return "fail"
 
@@ -1053,31 +1105,42 @@ def main() -> None:
             shop_name = store["shopName"]
             lat = store["lat"]
             lng = store["lng"]
-            out_file = output_file_for(lat, lng, shop_code, ext="json")
+            for opening_type in opening_types:
+                out_file = output_file_for(lat, lng, shop_code, opening_type=opening_type, ext="json")
 
-            result = _process_store(store)
-            if result == "cache":
-                success_count += 1
-                status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
-                logger.info("[CACHE] Using existing JSON for %s (%s) -> %s | %s", shop_code, shop_name, out_file, status_line)
-            elif result == "ok":
-                success_count += 1
-                status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
-                logger.info("[OK] Saved JSON for %s to %s | %s", shop_code, out_file, status_line)
-            else:
-                skip_count += 1
+                result = _process_store(store, opening_type)
+                if result == "cache":
+                    success_count += 1
+                    status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
+                    logger.info(
+                        "[CACHE] Using existing JSON for %s (%s, %s) -> %s | %s",
+                        shop_code,
+                        shop_name,
+                        opening_type,
+                        out_file,
+                        status_line,
+                    )
+                elif result == "ok":
+                    success_count += 1
+                    status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
+                    logger.info("[OK] Saved JSON for %s (%s) to %s | %s", shop_code, opening_type, out_file, status_line)
+                else:
+                    skip_count += 1
         return
 
     logger.info("[INFO] Running with %d workers (concurrent)", PANDA_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=PANDA_WORKERS) as executor:
-        future_to_store = {executor.submit(_process_store, store): store for store in stores}
-        for future in concurrent.futures.as_completed(future_to_store):
-            store = future_to_store[future]
+        jobs = [(store, opening_type) for store in stores for opening_type in opening_types]
+        future_to_job = {
+            executor.submit(_process_store, store, opening_type): (store, opening_type) for store, opening_type in jobs
+        }
+        for future in concurrent.futures.as_completed(future_to_job):
+            store, opening_type = future_to_job[future]
             shop_code = store["shopCode"]
             shop_name = store["shopName"]
             lat = store["lat"]
             lng = store["lng"]
-            out_file = output_file_for(lat, lng, shop_code, ext="json")
+            out_file = output_file_for(lat, lng, shop_code, opening_type=opening_type, ext="json")
             try:
                 result = future.result()
             except Exception as exc:
@@ -1086,16 +1149,23 @@ def main() -> None:
 
             if result == "cache":
                 success_count += 1
-                status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
-                logger.info("[CACHE] Using existing JSON for %s (%s) -> %s | %s", shop_code, shop_name, out_file, status_line)
+                status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
+                logger.info(
+                    "[CACHE] Using existing JSON for %s (%s, %s) -> %s | %s",
+                    shop_code,
+                    shop_name,
+                    opening_type,
+                    out_file,
+                    status_line,
+                )
             elif result == "ok":
                 success_count += 1
-                status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
-                logger.info("[OK] Saved JSON for %s to %s | %s", shop_code, out_file, status_line)
+                status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
+                logger.info("[OK] Saved JSON for %s (%s) to %s | %s", shop_code, opening_type, out_file, status_line)
             else:
                 skip_count += 1
-                status_line = progress_snapshot(run_start, success_count, skip_count, total_stores)
-                logger.info("[SKIP] %s (%s) failed | %s", shop_code, shop_name, status_line)
+                status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
+                logger.info("[SKIP] %s (%s, %s) failed | %s", shop_code, shop_name, opening_type, status_line)
 
 
 if __name__ == "__main__":
@@ -1107,7 +1177,13 @@ if __name__ == "__main__":
 
 # example usage:
 # without menu item parsing:
-#   python zyte_panda_menu.py
+#   python zyte_panda_menu.py --opening-type delivery
+# crawl pickup menus:
+#   python zyte_panda_menu.py --opening-type pickup
+# crawl both delivery and pickup menus:
+#   python zyte_panda_menu.py --opening-type both
+# crawl only first 5 shops for testing:
+#   python zyte_panda_menu.py --opening-type both --limit-for-testing 5
 # with menu item parsing, part A: (侑霖)
 #   python zyte_panda_menu.py --item-parse --parse-part A --num-workers 16
 # with menu item parsing, part B: (友承)
