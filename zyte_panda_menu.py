@@ -1179,9 +1179,9 @@ if __name__ == "__main__":
 # without menu item parsing:
 #   python zyte_panda_menu.py --opening-type delivery
 # crawl pickup menus:
-#   python zyte_panda_menu.py --opening-type pickup
+#   python zyte_panda_menu.py --opening-type pickup --item-parse
 # crawl both delivery and pickup menus:
-#   python zyte_panda_menu.py --opening-type both
+#   python zyte_panda_menu.py --opening-type both --item-parse
 # crawl only first 5 shops for testing:
 #   python zyte_panda_menu.py --opening-type both --limit-for-testing 5
 # with menu item parsing, part A: (侑霖)
