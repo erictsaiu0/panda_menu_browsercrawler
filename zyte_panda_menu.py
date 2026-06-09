@@ -69,12 +69,11 @@ BASE_DIR = Path(__file__).resolve().parent
 LOCATION_CSV_PATH = Path("../panda_data") / "shopLst" / "rolling.csv"
 TODAY = datetime.now().strftime("%Y-%m-%d")
 OUTPUT_BASE = Path("../panda_data_js") / "panda_menu"
-OUTPUT_DIR = OUTPUT_BASE / TODAY
 LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / f"{TODAY}.log"
 
 os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_BASE, exist_ok=True)
 
 logging.basicConfig(
     filename=str(LOG_FILE),
@@ -248,9 +247,23 @@ ACCESS_DENIED_MARKERS = (
 )
 
 
-def output_file_for(lat: float, lng: float, shop_code: str, opening_type: str = "delivery", ext: str = "json") -> Path:
+def output_dir_for(run_opening_type: str, opening_type: str) -> Path:
+    if run_opening_type == "both":
+        return OUTPUT_BASE / f"{TODAY}-{opening_type}"
+    return OUTPUT_BASE / TODAY
+
+
+def output_file_for(
+    lat: float,
+    lng: float,
+    shop_code: str,
+    opening_type: str = "delivery",
+    run_opening_type: str = "delivery",
+    ext: str = "json",
+) -> Path:
+    out_dir = output_dir_for(run_opening_type, opening_type)
     suffix = "" if opening_type == "delivery" else f"_{opening_type}"
-    return OUTPUT_DIR / f"{lat}_{lng}_{shop_code}{suffix}.{ext}"
+    return out_dir / f"{lat}_{lng}_{shop_code}{suffix}.{ext}"
 
 
 def build_restaurant_url(shop_code: str, opening_type: str, redirection_url: Optional[str] = None) -> str:
@@ -1084,6 +1097,9 @@ def main() -> None:
     opening_types = resolve_opening_types(args.opening_type)
     total_jobs = total_stores * len(opening_types)
 
+    for opening_type in opening_types:
+        os.makedirs(output_dir_for(args.opening_type, opening_type), exist_ok=True)
+
     def _process_store(store: Dict[str, float], opening_type: str) -> str:
         shop_code = store["shopCode"]
         shop_name = store["shopName"]
@@ -1092,7 +1108,14 @@ def main() -> None:
         lng = store["lng"]
 
         url = build_restaurant_url(shop_code, opening_type, redirection_url=redirection_url)
-        out_file = output_file_for(lat, lng, shop_code, opening_type=opening_type, ext="json")
+        out_file = output_file_for(
+            lat,
+            lng,
+            shop_code,
+            opening_type=opening_type,
+            run_opening_type=args.opening_type,
+            ext="json",
+        )
 
         if SKIP_EXISTING_OUTPUT and out_file.exists():
             return "cache"
@@ -1120,7 +1143,14 @@ def main() -> None:
             lat = store["lat"]
             lng = store["lng"]
             for opening_type in opening_types:
-                out_file = output_file_for(lat, lng, shop_code, opening_type=opening_type, ext="json")
+                out_file = output_file_for(
+                    lat,
+                    lng,
+                    shop_code,
+                    opening_type=opening_type,
+                    run_opening_type=args.opening_type,
+                    ext="json",
+                )
 
                 result = _process_store(store, opening_type)
                 if result == "cache":
@@ -1154,7 +1184,14 @@ def main() -> None:
             shop_name = store["shopName"]
             lat = store["lat"]
             lng = store["lng"]
-            out_file = output_file_for(lat, lng, shop_code, opening_type=opening_type, ext="json")
+            out_file = output_file_for(
+                lat,
+                lng,
+                shop_code,
+                opening_type=opening_type,
+                run_opening_type=args.opening_type,
+                ext="json",
+            )
             try:
                 result = future.result()
             except Exception as exc:

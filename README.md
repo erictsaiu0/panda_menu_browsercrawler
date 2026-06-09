@@ -57,7 +57,10 @@ Required columns:
 - `longitude`
 
 ## Output
-- JSON: `../panda_data_js/panda_menu/YYYY-MM-DD/`
+- JSON:
+  - single mode (`delivery` or `pickup`): `../panda_data_js/panda_menu/YYYY-MM-DD/`
+  - `--opening-type both`: `../panda_data_js/panda_menu/YYYY-MM-DD-delivery/` and `../panda_data_js/panda_menu/YYYY-MM-DD-pickup/`
+  - pickup files keep the `_pickup.json` suffix in both single and `both` modes
 - Logs: `logs/YYYY-MM-DD.log`
 
 ## Usage
