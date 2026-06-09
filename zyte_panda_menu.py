@@ -33,7 +33,8 @@ import requests
 import urllib3
 from requests.exceptions import RequestException, SSLError
 
-dotenv.load_dotenv()
+FORCE_RELOAD_DOTENV = os.environ.get("PANDA_FORCE_RELOAD_DOTENV", "0") in ("1", "true", "True")
+dotenv.load_dotenv(override=FORCE_RELOAD_DOTENV)
 
 
 class AccessDeniedError(RuntimeError):
@@ -131,6 +132,14 @@ def set_dom_menus(enabled: bool) -> None:
     logger.info("[CONFIG] DOM menu extraction = %s", enabled)
 
 
+def _mask_secret(value: Optional[str], head: int = 4, tail: int = 4) -> str:
+    if not value:
+        return "(missing)"
+    if len(value) <= head + tail:
+        return "*" * len(value)
+    return f"{value[:head]}...{value[-tail:]}"
+
+
 def _compose_verify_bundle() -> Optional[str]:
     """
     Requests relies on certifi CA store and ignores OS additions. When a Zyte CA
@@ -197,6 +206,11 @@ logger.info(
     ZYTE_SKIP_VENDOR_API_FALLBACK,
 )
 logger.info("[CONFIG] workers=%s delay=%.2f..%.2fs", PANDA_WORKERS, PER_REQUEST_DELAY_MIN_SEC, PER_REQUEST_DELAY_MAX_SEC)
+logger.info(
+    "[CONFIG] zyte_api_key=%s dotenv_override=%s",
+    _mask_secret(ZYTE_API_KEY),
+    FORCE_RELOAD_DOTENV,
+)
 
 # NOTE: requests.Session is not guaranteed thread-safe. When running with
 # concurrency, use a per-thread Session that tracks the current global verify

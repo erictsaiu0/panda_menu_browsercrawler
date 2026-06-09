@@ -20,6 +20,19 @@ You can also put it in a `.env` file (preferred):
 ZYTE_API_KEY=your_zyte_key
 ```
 
+If you previously exported an old key in your shell, clear it before running the crawler so `.env` can take effect:
+```bash
+unset ZYTE_API_KEY
+unset CRAWLERA_API_KEY
+unset CRAWLERA_APIKEY
+python zyte_panda_menu.py --opening-type both --limit-for-testing 2
+```
+
+If you want `.env` to override an already exported shell value without unsetting it first:
+```bash
+PANDA_FORCE_RELOAD_DOTENV=1 python zyte_panda_menu.py --opening-type both --limit-for-testing 2
+```
+
 ## Zyte CA bundle
 If you need to trust Zyte's custom CA:
 - Place the CA file in this repo and set `ZYTE_CA_BUNDLE` to its path, or
