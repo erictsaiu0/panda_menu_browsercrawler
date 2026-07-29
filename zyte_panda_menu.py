@@ -60,6 +60,9 @@ DEDUP_SHOP_CODES = os.environ.get("PANDA_DEDUP_SHOPS", "1") not in ("0", "false"
 DEFAULT_OPENING_TYPE = os.environ.get("PANDA_OPENING_TYPE", "delivery").strip().lower() or "delivery"
 if DEFAULT_OPENING_TYPE not in {"delivery", "pickup", "both"}:
     DEFAULT_OPENING_TYPE = "delivery"
+NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+NTFY_TOPIC = os.environ.get("PANDA_MENU_NTFY_TOPIC", "fp-menu-97241")
+NTFY_TOKEN = os.environ.get("NTFY_TOKEN")
 
 # ============================================
 # Path & logging setup
@@ -933,6 +936,25 @@ def progress_snapshot(run_start_time: float, success_count: int, skip_count: int
     return f"success={success_count} skip={skip_count} avg={avg_seconds:.1f}s ETA={eta_str}"
 
 
+def send_notification(title: str, message: str, priority: str = "default") -> None:
+    if not NTFY_TOPIC:
+        return
+    headers = {"Title": title, "Priority": priority}
+    if NTFY_TOKEN:
+        headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
+    try:
+        response = requests.post(
+            f"{NTFY_SERVER}/{NTFY_TOPIC}",
+            data=message.encode("utf-8"),
+            headers=headers,
+            timeout=10,
+        )
+        response.raise_for_status()
+        logger.info("Sent ntfy notification topic=%s title=%s", NTFY_TOPIC, title)
+    except RequestException as error:
+        logger.warning("ntfy notification failed: %s", error)
+
+
 # ============================================
 # Crawl logic
 # ============================================
@@ -1045,7 +1067,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
 
     global PANDA_WORKERS
@@ -1092,6 +1114,7 @@ def main() -> None:
 
     total_stores = len(stores)
     success_count = 0
+    cache_count = 0
     skip_count = 0
     run_start = time.perf_counter()
     opening_types = resolve_opening_types(args.opening_type)
@@ -1136,94 +1159,139 @@ def main() -> None:
             logger.error("[ERROR] write %s: %s", out_file, e)
             return "fail"
 
-    if PANDA_WORKERS <= 1:
-        for store in stores:
-            shop_code = store["shopCode"]
-            shop_name = store["shopName"]
-            lat = store["lat"]
-            lng = store["lng"]
-            for opening_type in opening_types:
-                out_file = output_file_for(
-                    lat,
-                    lng,
-                    shop_code,
-                    opening_type=opening_type,
-                    run_opening_type=args.opening_type,
-                    ext="json",
-                )
-
-                result = _process_store(store, opening_type)
-                if result == "cache":
-                    success_count += 1
-                    status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
-                    logger.info(
-                        "[CACHE] Using existing JSON for %s (%s, %s) -> %s | %s",
-                        shop_code,
-                        shop_name,
-                        opening_type,
-                        out_file,
-                        status_line,
-                    )
-                elif result == "ok":
-                    success_count += 1
-                    status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
-                    logger.info("[OK] Saved JSON for %s (%s) to %s | %s", shop_code, opening_type, out_file, status_line)
-                else:
-                    skip_count += 1
-        return
-
-    logger.info("[INFO] Running with %d workers (concurrent)", PANDA_WORKERS)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=PANDA_WORKERS) as executor:
-        jobs = [(store, opening_type) for store in stores for opening_type in opening_types]
-        future_to_job = {
-            executor.submit(_process_store, store, opening_type): (store, opening_type) for store, opening_type in jobs
-        }
-        for future in concurrent.futures.as_completed(future_to_job):
-            store, opening_type = future_to_job[future]
-            shop_code = store["shopCode"]
-            shop_name = store["shopName"]
-            lat = store["lat"]
-            lng = store["lng"]
-            out_file = output_file_for(
-                lat,
-                lng,
+    def _record_result(store: Dict[str, float], opening_type: str, result: str) -> None:
+        nonlocal success_count, cache_count, skip_count
+        shop_code = store["shopCode"]
+        shop_name = store["shopName"]
+        out_file = output_file_for(
+            store["lat"],
+            store["lng"],
+            shop_code,
+            opening_type=opening_type,
+            run_opening_type=args.opening_type,
+            ext="json",
+        )
+        if result == "cache":
+            success_count += 1
+            cache_count += 1
+            status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
+            logger.info(
+                "[CACHE] Using existing JSON for %s (%s, %s) -> %s | %s",
                 shop_code,
-                opening_type=opening_type,
-                run_opening_type=args.opening_type,
-                ext="json",
+                shop_name,
+                opening_type,
+                out_file,
+                status_line,
             )
-            try:
-                result = future.result()
-            except Exception as exc:
-                logger.error("[ERROR] %s (%s) worker crashed: %s", shop_code, shop_name, exc)
-                result = "fail"
+        elif result == "ok":
+            success_count += 1
+            status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
+            logger.info(
+                "[OK] Saved JSON for %s (%s) to %s | %s",
+                shop_code,
+                opening_type,
+                out_file,
+                status_line,
+            )
+        else:
+            skip_count += 1
+            status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
+            logger.info(
+                "[SKIP] %s (%s, %s) failed | %s",
+                shop_code,
+                shop_name,
+                opening_type,
+                status_line,
+            )
 
-            if result == "cache":
-                success_count += 1
-                status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
-                logger.info(
-                    "[CACHE] Using existing JSON for %s (%s, %s) -> %s | %s",
-                    shop_code,
-                    shop_name,
-                    opening_type,
-                    out_file,
-                    status_line,
-                )
-            elif result == "ok":
-                success_count += 1
-                status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
-                logger.info("[OK] Saved JSON for %s (%s) to %s | %s", shop_code, opening_type, out_file, status_line)
-            else:
-                skip_count += 1
-                status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
-                logger.info("[SKIP] %s (%s, %s) failed | %s", shop_code, shop_name, opening_type, status_line)
+    try:
+        if PANDA_WORKERS <= 1:
+            for store in stores:
+                for opening_type in opening_types:
+                    _record_result(store, opening_type, _process_store(store, opening_type))
+        else:
+            logger.info("[INFO] Running with %d workers (concurrent)", PANDA_WORKERS)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=PANDA_WORKERS) as executor:
+                jobs = [(store, opening_type) for store in stores for opening_type in opening_types]
+                future_to_job = {
+                    executor.submit(_process_store, store, opening_type): (store, opening_type)
+                    for store, opening_type in jobs
+                }
+                for future in concurrent.futures.as_completed(future_to_job):
+                    store, opening_type = future_to_job[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        logger.error(
+                            "[ERROR] %s (%s) worker crashed: %s",
+                            store["shopCode"],
+                            store["shopName"],
+                            exc,
+                        )
+                        result = "fail"
+                    _record_result(store, opening_type, result)
+    except KeyboardInterrupt:
+        elapsed = time.perf_counter() - run_start
+        logger.warning("Interrupted; completed JSON files remain available as checkpoints")
+        send_notification(
+            "Foodpanda Zyte menu crawler paused",
+            (
+                f"Run date: {TODAY}\n"
+                f"Opening type: {args.opening_type}\n"
+                f"Completed jobs: {success_count}/{total_jobs}\n"
+                f"Failed jobs: {skip_count}\n"
+                f"Elapsed: {elapsed / 3600:.2f} hours\n"
+                f"Output: {OUTPUT_BASE}"
+            ),
+            "high",
+        )
+        return 130
+
+    elapsed = time.perf_counter() - run_start
+    summary = (
+        f"Run date: {TODAY}\n"
+        f"Opening type: {args.opening_type}\n"
+        f"Stores: {total_stores}\n"
+        f"Jobs: {total_jobs}\n"
+        f"Fresh success: {success_count - cache_count}\n"
+        f"Cache: {cache_count}\n"
+        f"Failed: {skip_count}\n"
+        f"Elapsed: {elapsed / 3600:.2f} hours\n"
+        f"Output: {OUTPUT_BASE}"
+    )
+    logger.info(summary.replace("\n", " | "))
+    if args.limit_for_testing:
+        title = "Foodpanda Zyte menu crawler test completed"
+        priority = "default" if skip_count == 0 else "high"
+    elif skip_count == 0:
+        title = "Foodpanda Zyte menu crawler completed"
+        priority = "high"
+    else:
+        title = "Foodpanda Zyte menu crawler incomplete"
+        priority = "urgent"
+    send_notification(title, summary, priority)
+    return 0 if skip_count == 0 or args.limit_for_testing else 1
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        logger.warning("Interrupted before crawl progress was initialized")
+        send_notification(
+            "Foodpanda Zyte menu crawler paused",
+            f"Run date: {TODAY}\nOutput: {OUTPUT_BASE}",
+            "high",
+        )
+        raise SystemExit(130)
     except Exception as e:
         logger.exception("Fatal error: %s", e)
+        send_notification(
+            "Foodpanda Zyte menu crawler failed",
+            f"Run date: {TODAY}\nError: {e}\nOutput: {OUTPUT_BASE}",
+            "urgent",
+        )
+        raise SystemExit(1)
 
 
 # example usage:
