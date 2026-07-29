@@ -8,3 +8,5 @@ panda_data/shopLst/rolling.csv
 .gitignore
 .vscode/settings.json
 drivers/geckodriver.exe
+zyte-ca-982.crt
+.env

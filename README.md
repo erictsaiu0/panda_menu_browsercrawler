@@ -20,6 +20,19 @@ You can also put it in a `.env` file (preferred):
 ZYTE_API_KEY=your_zyte_key
 ```
 
+## ntfy notifications
+Notifications are sent to `https://ntfy.sh/fp-menu-97241` by default for completed,
+incomplete, paused, test, and fatal runs.
+
+Optional environment variables:
+```ini
+NTFY_SERVER=https://ntfy.sh
+PANDA_MENU_NTFY_TOPIC=fp-menu-97241
+# NTFY_TOKEN=your_token
+```
+
+Set `PANDA_MENU_NTFY_TOPIC` to an empty value to disable notifications.
+
 If you previously exported an old key in your shell, clear it before running the crawler so `.env` can take effect:
 ```bash
 unset ZYTE_API_KEY
