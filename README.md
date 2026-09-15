@@ -69,6 +69,31 @@ Required columns:
 - `latitude`
 - `longitude`
 
+The input path can be overridden with `PANDA_ROLLING_CSV`.
+
+## Opening-hours scheduler
+
+The crawler loads `../menu_opening_hour_wide.csv` and keeps running until all
+jobs are complete. Valid existing JSON is accepted first. Stores with known
+hours are crawled only inside a safe opening window and are ordered by upcoming
+closing deadline; `UNKNOWN` or missing schedules remain crawlable at lower
+priority. When only closed stores remain, the process waits for the next opening
+time automatically.
+
+Relevant environment variables:
+
+- `MENU_OPENING_HOURS_CSV`: override the schedule CSV path.
+- `PANDA_CLOSING_BUFFER_MINUTES`: stop starting/retrying requests this many
+  minutes before close (default `5`).
+- `MENU_MINIMUM_BUFFER_MINUTES`: minimum adaptive buffer for short windows
+  (default `2`).
+- `MENU_SCHEDULER_POLL_SECONDS`: maximum scheduler wake interval (default `60`).
+- `PANDA_MENU_OUTPUT_BASE`: override the output base directory.
+
+Only one Foodpanda crawler can run at a time. A full run locks its rolling.csv
+snapshot under `.runs/`; after interruption, the next invocation with the same
+`--opening-type` resumes the same run date and reuses completed JSON files.
+
 ## Output
 - JSON:
   - single mode (`delivery` or `pickup`): `../panda_data_js/panda_menu/YYYY-MM-DD/`

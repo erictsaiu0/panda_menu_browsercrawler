@@ -14,18 +14,23 @@ import base64
 import certifi
 import concurrent.futures
 import csv
+import fcntl
+import heapq
 import json
 import logging
 import os
 import random
 import re
+import shutil
+import sys
 import threading
 import time
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timedelta
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import dotenv
@@ -33,12 +38,26 @@ import requests
 import urllib3
 from requests.exceptions import RequestException, SSLError
 
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = BASE_DIR.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from menu_opening_scheduler import OpeningHoursIndex, TAIPEI_TZ
+
+
 FORCE_RELOAD_DOTENV = os.environ.get("PANDA_FORCE_RELOAD_DOTENV", "0") in ("1", "true", "True")
-dotenv.load_dotenv(override=FORCE_RELOAD_DOTENV)
+dotenv.load_dotenv(BASE_DIR / ".env", override=FORCE_RELOAD_DOTENV)
 
 
 class AccessDeniedError(RuntimeError):
     """Raised when Foodpanda serves a captcha/block page."""
+
+    pass
+
+
+class CrawlWindowClosed(RuntimeError):
+    """Raised before a new request when the safe dispatch window has closed."""
 
     pass
 
@@ -68,12 +87,37 @@ NTFY_TOKEN = os.environ.get("NTFY_TOKEN")
 # Path & logging setup
 # ============================================
 
-BASE_DIR = Path(__file__).resolve().parent
-LOCATION_CSV_PATH = Path("../panda_data") / "shopLst" / "rolling.csv"
-TODAY = datetime.now().strftime("%Y-%m-%d")
-OUTPUT_BASE = Path("../panda_data_js") / "panda_menu"
+LOCATION_CSV_PATH = Path(
+    os.environ.get(
+        "PANDA_ROLLING_CSV",
+        str(PROJECT_DIR / "panda_data" / "shopLst" / "rolling.csv"),
+    )
+).resolve()
+TODAY = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+OUTPUT_BASE = Path(
+    os.environ.get(
+        "PANDA_MENU_OUTPUT_BASE",
+        str(PROJECT_DIR / "panda_data_js" / "panda_menu"),
+    )
+).resolve()
 LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / f"{TODAY}.log"
+RUN_LOCK_FILE = OUTPUT_BASE / ".zyte_panda_menu.lock"
+OPENING_HOURS_CSV = Path(
+    os.environ.get(
+        "MENU_OPENING_HOURS_CSV",
+        str(PROJECT_DIR / "menu_opening_hour_wide.csv"),
+    )
+).resolve()
+OPENING_CLOSING_BUFFER = timedelta(
+    minutes=max(0.0, float(os.environ.get("PANDA_CLOSING_BUFFER_MINUTES", "5")))
+)
+OPENING_MINIMUM_BUFFER = timedelta(
+    minutes=max(0.0, float(os.environ.get("MENU_MINIMUM_BUFFER_MINUTES", "2")))
+)
+SCHEDULER_POLL_SECONDS = max(
+    1.0, float(os.environ.get("MENU_SCHEDULER_POLL_SECONDS", "60"))
+)
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(OUTPUT_BASE, exist_ok=True)
@@ -85,6 +129,83 @@ logging.basicConfig(
     encoding="utf-8",
 )
 logger = logging.getLogger("panda_menu_zyte")
+
+
+def acquire_run_lock() -> Any:
+    RUN_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle = RUN_LOCK_FILE.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError(
+            f"Another Foodpanda menu crawler is already running ({RUN_LOCK_FILE})"
+        )
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"pid={os.getpid()} started={datetime.now(TAIPEI_TZ).isoformat()}\n")
+    handle.flush()
+    return handle
+
+
+def load_json_file(path: Path) -> Optional[dict]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def atomic_write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, ensure_ascii=False, separators=(",", ":"))
+    os.replace(temp_path, path)
+
+
+def active_run_file(opening_type: str) -> Path:
+    return OUTPUT_BASE / f"active_run_{opening_type}.json"
+
+
+def resolve_run_date(opening_type: str, is_test: bool) -> str:
+    if not is_test:
+        active = load_json_file(active_run_file(opening_type))
+        if active and active.get("status") == "running":
+            if active.get("runDate"):
+                return str(active["runDate"])
+    return datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+
+def update_active_run(
+    run_date: str,
+    opening_type: str,
+    status: str,
+    **extra: Any,
+) -> None:
+    payload = {
+        "version": 1,
+        "runDate": run_date,
+        "openingType": opening_type,
+        "status": status,
+        "updatedAt": datetime.now(TAIPEI_TZ).isoformat(),
+    }
+    payload.update(extra)
+    atomic_write_json(active_run_file(opening_type), payload)
+
+
+def prepare_input_snapshot(run_date: str) -> Path:
+    snapshot = OUTPUT_BASE / ".runs" / run_date / "rolling.csv"
+    if snapshot.exists():
+        logger.info("[INFO] Using run-locked rolling.csv snapshot: %s", snapshot)
+        return snapshot
+    if not LOCATION_CSV_PATH.exists():
+        raise FileNotFoundError(f"CSV not found: {LOCATION_CSV_PATH}")
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(LOCATION_CSV_PATH, snapshot)
+    logger.info("[INFO] Locked rolling.csv for this run: %s", snapshot)
+    return snapshot
 
 
 # ============================================
@@ -190,6 +311,10 @@ if isinstance(session.verify, bool) and session.verify is False and ZYTE_SUPPRES
         pass
 
 SSL_FALLBACK_ACTIVE = isinstance(session.verify, bool) and session.verify is False
+_ZYTE_METRICS_LOCK = threading.Lock()
+ZYTE_REQUEST_ATTEMPTS = 0
+ZYTE_SUCCESSFUL_RESPONSES = 0
+ZYTE_RESPONSE_SECONDS = 0.0
 
 verify_label = ZYTE_CA_BUNDLE if ZYTE_CA_BUNDLE else str(ZYTE_VERIFY_SSL)
 logger.info(
@@ -267,6 +392,26 @@ def output_file_for(
     out_dir = output_dir_for(run_opening_type, opening_type)
     suffix = "" if opening_type == "delivery" else f"_{opening_type}"
     return out_dir / f"{lat}_{lng}_{shop_code}{suffix}.{ext}"
+
+
+def is_successful_output(
+    path: Path,
+    require_menu: bool = False,
+    opening_type: Optional[str] = None,
+    expected_shop_code: Optional[str] = None,
+) -> bool:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            return False
+        if expected_shop_code:
+            actual_shop_code = _payload_vendor_code(payload)
+            if actual_shop_code and actual_shop_code != str(expected_shop_code):
+                return False
+        return not require_menu or _has_complete_menu(payload, opening_type)
+    except (OSError, ValueError):
+        return False
 
 
 def build_restaurant_url(shop_code: str, opening_type: str, redirection_url: Optional[str] = None) -> str:
@@ -371,29 +516,163 @@ def _enable_ssl_insecure_mode(reason: str) -> bool:
 # ============================================
 
 
-def _extract_json_from_html(html: str, marker: str) -> Optional[dict]:
+def _extract_balanced_js_objects(html: str, marker: str) -> List[str]:
+    """Return object literals assigned after every occurrence of ``marker``.
+
+    Foodpanda embeds JavaScript objects rather than strict JSON.  Looking for
+    ``</script>`` is too broad because the script can contain more statements;
+    this scanner stops at the matching closing brace while respecting quoted
+    strings.
+    """
     if not html:
+        return []
+
+    objects: List[str] = []
+    search_from = 0
+    while True:
+        marker_index = html.find(marker, search_from)
+        if marker_index == -1:
+            break
+        start = marker_index + len(marker)
+        while start < len(html) and html[start].isspace():
+            start += 1
+        if start >= len(html) or html[start] != "{":
+            search_from = marker_index + len(marker)
+            continue
+
+        depth = 0
+        quote: Optional[str] = None
+        escaped = False
+        object_end: Optional[int] = None
+        for index in range(start, len(html)):
+            char = html[index]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                continue
+            if char in ('"', "'"):
+                quote = char
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    object_end = index + 1
+                    objects.append(html[start:object_end])
+                    break
+        search_from = object_end or (marker_index + len(marker))
+    return objects
+
+
+def _extract_balanced_js_object(html: str, marker: str) -> Optional[str]:
+    objects = _extract_balanced_js_objects(html, marker)
+    return objects[0] if objects else None
+
+
+def _normalize_js_undefined(snippet: str) -> str:
+    """Replace bare JavaScript ``undefined`` values with JSON ``null``.
+
+    The replacement is token-aware so text inside quoted strings is never
+    changed.
+    """
+    output: List[str] = []
+    index = 0
+    quote: Optional[str] = None
+    escaped = False
+    length = len(snippet)
+    while index < length:
+        char = snippet[index]
+        if quote is not None:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in ('"', "'"):
+            quote = char
+            output.append(char)
+            index += 1
+            continue
+        if snippet.startswith("undefined", index):
+            previous = index - 1
+            while previous >= 0 and snippet[previous].isspace():
+                previous -= 1
+            following = index + len("undefined")
+            while following < length and snippet[following].isspace():
+                following += 1
+            previous_char = snippet[previous] if previous >= 0 else ""
+            following_char = snippet[following] if following < length else ""
+            if previous_char in ":[," and following_char in ",}]":
+                output.append("null")
+                index += len("undefined")
+                continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def _extract_json_from_html(html: str, marker: str) -> Optional[dict]:
+    snippet = _extract_balanced_js_object(html, marker)
+    if not snippet:
         return None
-    idx = html.find(marker)
-    if idx == -1:
-        return None
-    idx += len(marker)
-    end = html.find("</script>", idx)
-    if end == -1:
-        return None
-    snippet = html[idx:end].strip()
-    if snippet.endswith(";"):
-        snippet = snippet[:-1]
-    try:
-        return json.loads(snippet)
-    except Exception:
-        return None
+    for candidate in (snippet, _normalize_js_undefined(snippet)):
+        try:
+            value = json.loads(candidate)
+            return value if isinstance(value, dict) else None
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def extract_vendor_payload(html: str) -> Optional[dict]:
     return _extract_json_from_html(html, "window.__PRELOADED_STATE__=") or _extract_json_from_html(
         html, "window.__NEXT_DATA__="
     )
+
+
+def extract_provider_payload(html: str) -> Optional[dict]:
+    """Extract the rendered page's hydration state without calling vendor API."""
+    fragments: List[dict] = []
+    markers = (
+        "window.__PROVIDER_PROPS__=",
+        "window.__PROVIDER_PROPS__=Object.assign(window.__PROVIDER_PROPS__||{},",
+    )
+    for marker in markers:
+        for snippet in _extract_balanced_js_objects(html, marker):
+            parsed: Optional[dict] = None
+            for candidate in (snippet, _normalize_js_undefined(snippet)):
+                try:
+                    value = json.loads(candidate)
+                    if isinstance(value, dict):
+                        parsed = value
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if parsed is not None:
+                fragments.append(parsed)
+
+    if not fragments:
+        return None
+
+    def merge_dicts(target: Dict[str, Any], incoming: Dict[str, Any]) -> None:
+        for key, value in incoming.items():
+            if isinstance(target.get(key), dict) and isinstance(value, dict):
+                merge_dicts(target[key], value)
+            else:
+                target[key] = value
+
+    merged: Dict[str, Any] = {}
+    for fragment in fragments:
+        merge_dicts(merged, fragment)
+    return merged
 
 
 def _has_menus(payload: Optional[dict]) -> bool:
@@ -414,6 +693,271 @@ def _has_menus(payload: Optional[dict]) -> bool:
     return False
 
 
+def _menus_from_payload(payload: Optional[dict]) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    candidates: List[Any] = [payload.get("menus")]
+    vendor_wrapper = payload.get("vendor")
+    if isinstance(vendor_wrapper, dict) and isinstance(vendor_wrapper.get("data"), dict):
+        candidates.append(vendor_wrapper["data"].get("menus"))
+    if isinstance(payload.get("data"), dict):
+        candidates.append(payload["data"].get("menus"))
+    restaurant = payload.get("restaurant")
+    if isinstance(restaurant, dict):
+        candidates.append(restaurant.get("menus"))
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return [menu for menu in candidate if isinstance(menu, dict)]
+    return []
+
+
+def _menu_product_metrics(payload: Optional[dict]) -> Tuple[int, int, int]:
+    menus = _menus_from_payload(payload)
+    category_count = 0
+    product_count = 0
+    for menu in menus:
+        categories = menu.get("menu_categories") or menu.get("categories") or []
+        if not isinstance(categories, list):
+            continue
+        category_count += sum(isinstance(category, dict) for category in categories)
+        for category in categories:
+            if not isinstance(category, dict):
+                continue
+            products = category.get("products") or []
+            if isinstance(products, list):
+                product_count += sum(isinstance(product, dict) for product in products)
+    return len(menus), category_count, product_count
+
+
+def _has_complete_menu(payload: Optional[dict], opening_type: Optional[str] = None) -> bool:
+    menus = _menus_from_payload(payload)
+    if not menus or _menu_product_metrics(payload)[2] <= 0:
+        return False
+    if not opening_type:
+        return True
+
+    expected = opening_type.upper()
+    declared_types = {
+        str(value).upper()
+        for menu in menus
+        for value in (
+            menu.get("expedition_type"),
+            menu.get("expeditionType"),
+            menu.get("opening_type"),
+        )
+        if value
+    }
+    return not declared_types or expected in declared_types
+
+
+def _coerce_numeric_id(value: Any) -> Any:
+    if isinstance(value, str) and value.isdigit():
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _apollo_initial_state(provider_payload: Optional[dict]) -> Optional[Dict[str, Any]]:
+    if not isinstance(provider_payload, dict):
+        return None
+    apollo = provider_payload.get("apollo")
+    if not isinstance(apollo, dict):
+        return None
+    state = apollo.get("initialState")
+    return state if isinstance(state, dict) else None
+
+
+def _apollo_dereference(state: Dict[str, Any], value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    reference = value.get("__ref")
+    if isinstance(reference, str):
+        target = state.get(reference)
+        return target if isinstance(target, dict) else None
+    return value
+
+
+def _provider_identity(provider_payload: Optional[dict]) -> Dict[str, Any]:
+    state = _apollo_initial_state(provider_payload)
+    if not state:
+        return {}
+    root = state.get("ROOT_QUERY")
+    if not isinstance(root, dict):
+        return {}
+    for key, value in root.items():
+        if not str(key).startswith("restaurantDetailsPage(") or not isinstance(value, dict):
+            continue
+        vendor = value.get("vendorData")
+        if isinstance(vendor, dict):
+            return {
+                "code": vendor.get("code"),
+                "name": vendor.get("name"),
+            }
+    return {}
+
+
+def _payload_vendor_code(payload: Optional[dict]) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    vendor = payload.get("vendor")
+    if isinstance(vendor, dict) and isinstance(vendor.get("data"), dict):
+        code = vendor["data"].get("code")
+        if code:
+            return str(code)
+    data = payload.get("data")
+    if isinstance(data, dict) and data.get("code"):
+        return str(data["code"])
+    return None
+
+
+def _provider_menus_to_panda(
+    provider_payload: Optional[dict],
+    shop_code: str,
+    opening_type: str,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Convert Apollo's normalized cache into the legacy menu shape.
+
+    The result intentionally mirrors the vendor API keys consumed by existing
+    downstream code, while retaining additional fields available in the page.
+    """
+    state = _apollo_initial_state(provider_payload)
+    if not state:
+        return [], []
+
+    expected_type = opening_type.upper()
+    available_types: List[str] = []
+    menus_out: List[Dict[str, Any]] = []
+    seen_menus = set()
+
+    for state_key, menu in state.items():
+        if not str(state_key).startswith("RestaurantMenu:") or not isinstance(menu, dict):
+            continue
+        expedition_type = str(menu.get("expeditionType") or "").upper()
+        if expedition_type and expedition_type not in available_types:
+            available_types.append(expedition_type)
+        menu_vendor_code = str(menu.get("vendorCode") or "")
+        if expedition_type != expected_type:
+            continue
+        if shop_code and menu_vendor_code and menu_vendor_code != str(shop_code):
+            continue
+        menu_identity = (str(menu.get("id") or state_key), expedition_type)
+        if menu_identity in seen_menus:
+            continue
+        seen_menus.add(menu_identity)
+
+        categories_out: List[Dict[str, Any]] = []
+        category_refs = menu.get("categories") or []
+        if not isinstance(category_refs, list):
+            category_refs = []
+        for category_ref in category_refs:
+            category = _apollo_dereference(state, category_ref)
+            if not category:
+                continue
+            products_out: List[Dict[str, Any]] = []
+            product_refs = category.get("products") or []
+            if not isinstance(product_refs, list):
+                product_refs = []
+            for product_ref in product_refs:
+                product = _apollo_dereference(state, product_ref)
+                if not product:
+                    continue
+
+                price_attributes = product.get("priceAttributes")
+                if not isinstance(price_attributes, dict):
+                    price_attributes = {}
+                original_price = price_attributes.get("originalPrice")
+                discounted_price = price_attributes.get("discountedPrice")
+                display_price = discounted_price if discounted_price is not None else original_price
+                price_before_discount = original_price if discounted_price is not None else None
+
+                variations_out: List[Dict[str, Any]] = []
+                variation_refs = product.get("variations") or []
+                if not isinstance(variation_refs, list):
+                    variation_refs = []
+                resolved_variations = [
+                    variation
+                    for variation in (
+                        _apollo_dereference(state, variation_ref)
+                        for variation_ref in variation_refs
+                    )
+                    if variation
+                ]
+                for variation in resolved_variations:
+                    variation_price = variation.get("price")
+                    variation_before_discount = None
+                    if discounted_price is not None and len(resolved_variations) == 1:
+                        variation_before_discount = variation_price
+                        variation_price = discounted_price
+                    variations_out.append(
+                        {
+                            "id": _coerce_numeric_id(variation.get("id")),
+                            "code": variation.get("code"),
+                            "remote_code": variation.get("remoteCode"),
+                            "name": None,
+                            "price": variation_price,
+                            "price_before_discount": variation_before_discount,
+                            "container_price": variation.get("containerPrice"),
+                            "unit_pricing_info": variation.get("unitPricingInfo"),
+                        }
+                    )
+
+                image = product.get("image")
+                image_url = image.get("url") if isinstance(image, dict) else None
+                products_out.append(
+                    {
+                        "id": _coerce_numeric_id(product.get("id")),
+                        "code": product.get("code"),
+                        "name": product.get("title"),
+                        "description": product.get("description"),
+                        "image_url": image_url,
+                        "is_sold_out": bool(product.get("isSoldOut")),
+                        "is_customizable": bool(product.get("isCustomizable")),
+                        "is_bundle": bool(product.get("isBundle")),
+                        "is_alcoholic_item": bool(product.get("isAlcoholicItem")),
+                        "dietary_attributes": product.get("dietaryAttributes") or [],
+                        "tags": product.get("tags") or [],
+                        "price": display_price,
+                        "price_before_discount": price_before_discount,
+                        "container_price": price_attributes.get("containerPrice"),
+                        "product_variations": variations_out,
+                    }
+                )
+
+            master_category = _apollo_dereference(state, category.get("masterCategory"))
+            categories_out.append(
+                {
+                    "id": _coerce_numeric_id(category.get("id")),
+                    "code": category.get("code"),
+                    "name": category.get("title"),
+                    "description": category.get("description"),
+                    "master_category_id": (
+                        _coerce_numeric_id(master_category.get("id"))
+                        if master_category
+                        else None
+                    ),
+                    "products": products_out,
+                }
+            )
+
+        menus_out.append(
+            {
+                "id": _coerce_numeric_id(menu.get("id")),
+                "code": menu.get("code"),
+                "name": menu.get("title"),
+                "description": menu.get("description"),
+                "opening_time": menu.get("startTime"),
+                "closing_time": menu.get("endTime"),
+                "expedition_type": expedition_type,
+                "vendor_code": menu.get("vendorCode"),
+                "menu_categories": categories_out,
+            }
+        )
+
+    return menus_out, available_types
+
+
 def _parse_price_to_int(raw: Optional[str]) -> Optional[int]:
     if not raw:
         return None
@@ -427,6 +971,23 @@ def _parse_price_to_int(raw: Optional[str]) -> Optional[int]:
 
 
 class _FoodpandaMenuDomParser(HTMLParser):
+    _VOID_TAGS = {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._tag_stack: List[str] = []
@@ -440,6 +1001,7 @@ class _FoodpandaMenuDomParser(HTMLParser):
 
         self._capture_key: Optional[str] = None
         self._capture_buf: List[str] = []
+        self._capture_depth: Optional[int] = None
 
     @staticmethod
     def _attrs_to_dict(attrs: List[Tuple[str, Optional[str]]]) -> Dict[str, str]:
@@ -454,6 +1016,7 @@ class _FoodpandaMenuDomParser(HTMLParser):
             self._finish_capture()
         self._capture_key = key
         self._capture_buf = []
+        self._capture_depth = len(self._tag_stack)
 
     def _finish_capture(self) -> None:
         if not self._capture_key:
@@ -462,6 +1025,7 @@ class _FoodpandaMenuDomParser(HTMLParser):
         text = unescape("".join(self._capture_buf)).strip()
         self._capture_key = None
         self._capture_buf = []
+        self._capture_depth = None
         if not text:
             return
         if self._product is not None:
@@ -474,13 +1038,21 @@ class _FoodpandaMenuDomParser(HTMLParser):
             self._category[key] = text
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
-        self._tag_stack.append(tag)
+        tag = tag.lower()
+        if tag not in self._VOID_TAGS:
+            self._tag_stack.append(tag)
         attr_map = self._attrs_to_dict(attrs)
         test_id = attr_map.get("data-testid")
 
         if tag == "div" and test_id == "menu-category-section":
+            raw_category_id = attr_map.get("id")
+            category_id: Any = raw_category_id
+            if raw_category_id:
+                category_suffix = raw_category_id.rsplit("-", 1)[-1]
+                if category_suffix.isdigit():
+                    category_id = int(category_suffix)
             self._category = {
-                "id": attr_map.get("id"),
+                "id": category_id,
                 "name": None,
                 "description": None,
                 "products": [],
@@ -491,7 +1063,9 @@ class _FoodpandaMenuDomParser(HTMLParser):
         if self._category is None:
             return
 
-        if tag == "h2" and "dish-category-title" in (attr_map.get("class") or ""):
+        if test_id == "menu-category-section-title" or (
+            tag == "h2" and "dish-category-title" in (attr_map.get("class") or "")
+        ):
             self._start_capture("name")
             return
 
@@ -539,12 +1113,28 @@ class _FoodpandaMenuDomParser(HTMLParser):
             self._start_capture("price_before_discount")
             return
 
-    def handle_endtag(self, tag: str) -> None:
-        if self._capture_key:
-            self._finish_capture()
+        if tag == "img" and test_id == "menu-product-image":
+            image_url = attr_map.get("src") or attr_map.get("data-src")
+            if image_url and not self._product.get("image_url"):
+                self._product["image_url"] = image_url
+            return
 
-        if self._tag_stack:
-            self._tag_stack.pop()
+    def handle_startendtag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        for index in range(len(self._tag_stack) - 1, -1, -1):
+            if self._tag_stack[index] == tag:
+                del self._tag_stack[index:]
+                break
+
+        if (
+            self._capture_key
+            and self._capture_depth is not None
+            and len(self._tag_stack) < self._capture_depth
+        ):
+            self._finish_capture()
 
         if self._product is not None and self._product_depth is not None and len(self._tag_stack) < self._product_depth:
             if isinstance(self._product.get("price"), str):
@@ -557,6 +1147,23 @@ class _FoodpandaMenuDomParser(HTMLParser):
             self._product_depth = None
 
         if self._category is not None and self._category_depth is not None and len(self._tag_stack) < self._category_depth:
+            self.categories.append(self._category)
+            self._category = None
+            self._category_depth = None
+
+    def finish_open_nodes(self) -> None:
+        if self._capture_key:
+            self._finish_capture()
+        if self._product is not None:
+            if isinstance(self._product.get("price"), str):
+                self._product["price_value"] = _parse_price_to_int(self._product.get("price"))
+            if isinstance(self._product.get("price_before_discount"), str):
+                self._product["price_before_discount_value"] = _parse_price_to_int(
+                    self._product.get("price_before_discount")
+                )
+            self._product = None
+            self._product_depth = None
+        if self._category is not None:
             self.categories.append(self._category)
             self._category = None
             self._category_depth = None
@@ -575,6 +1182,7 @@ def _extract_dom_menu_categories(html: str) -> Optional[List[Dict[str, Any]]]:
     try:
         parser.feed(html)
         parser.close()
+        parser.finish_open_nodes()
     except Exception:
         return None
 
@@ -617,6 +1225,7 @@ def _dom_categories_to_panda_menus(categories: List[Dict[str, Any]]) -> List[Dic
                     "code": code,
                     "name": name,
                     "description": p.get("description"),
+                    "image_url": p.get("image_url"),
                     "is_sold_out": False,
                     "tags": [],
                     "price": price_val,
@@ -637,7 +1246,7 @@ def _dom_categories_to_panda_menus(categories: List[Dict[str, Any]]) -> List[Dic
 
         menu_categories.append(
             {
-                "id": None,
+                "id": cat.get("id"),
                 "name": cat_name,
                 "description": cat.get("description"),
                 "products": products_out,
@@ -729,11 +1338,14 @@ def _fetch_menus_via_api(
         "Api-Version": "7",
     }
     try:
+        _ensure_within_dispatch_window()
         resp = requests.get(base_url, params=params, headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         menus = data.get("data", {}).get("menus")
         return menus if isinstance(menus, list) else None
+    except CrawlWindowClosed:
+        raise
     except Exception as exc:
         logger.warning("[MENU_API] Vendor API fetch failed for %s: %s", vendor_code, exc)
         return None
@@ -742,6 +1354,12 @@ def _fetch_menus_via_api(
 # ============================================
 # Zyte API fetch logic
 # ============================================
+
+
+def _ensure_within_dispatch_window() -> None:
+    dispatch_deadline = getattr(_THREAD_LOCAL, "dispatch_deadline", None)
+    if dispatch_deadline and datetime.now(TAIPEI_TZ) >= dispatch_deadline:
+        raise CrawlWindowClosed("safe dispatch window closed before network request")
 
 
 def _build_zyte_request_payload(url: str) -> dict:
@@ -757,6 +1375,12 @@ def _build_zyte_request_payload(url: str) -> dict:
             payload["followRedirect"] = False
     if ZYTE_GEO_LOCATION:
         payload["geolocation"] = ZYTE_GEO_LOCATION
+    query = dict(parse_qsl(urlsplit(url).query, keep_blank_values=True))
+    payload["tags"] = {
+        "crawler": "zyte-panda-menu",
+        "response": "browser-html" if ZYTE_REQUEST_BROWSER_HTML else "http-response-body",
+        "opening-type": str(query.get("opening_type") or "unknown"),
+    }
     return payload
 
 
@@ -806,9 +1430,14 @@ def _extract_html_from_api_response(data: dict) -> Optional[str]:
 
 
 def fetch_page_via_zyte(url: str) -> str:
+    global ZYTE_REQUEST_ATTEMPTS, ZYTE_RESPONSE_SECONDS, ZYTE_SUCCESSFUL_RESPONSES
+
     last_error: Optional[Exception] = None
     for attempt in range(1, ZYTE_MAX_FETCH_RETRIES + 1):
+        _ensure_within_dispatch_window()
         payload = _build_zyte_request_payload(url)
+        with _ZYTE_METRICS_LOCK:
+            ZYTE_REQUEST_ATTEMPTS += 1
         try:
             start = time.perf_counter()
             response = _get_session().post(ZYTE_API_ENDPOINT, json=payload, timeout=ZYTE_TIMEOUT)
@@ -820,11 +1449,17 @@ def fetch_page_via_zyte(url: str) -> str:
             logger.warning("[FETCH] %s SSL error (attempt %s/%s): %s", url, attempt, ZYTE_MAX_FETCH_RETRIES, exc)
             time.sleep(min(5, RECAPTCHA_WAIT))
             continue
+
         except RequestException as exc:
             last_error = exc
             logger.warning("[FETCH] %s request error (attempt %s/%s): %s", url, attempt, ZYTE_MAX_FETCH_RETRIES, exc)
             time.sleep(min(5, RECAPTCHA_WAIT))
             continue
+
+        with _ZYTE_METRICS_LOCK:
+            ZYTE_RESPONSE_SECONDS += elapsed
+            if 200 <= response.status_code < 300:
+                ZYTE_SUCCESSFUL_RESPONSES += 1
 
         logger.info(
             "[FETCH] %s via Zyte API (status=%s) took %.1fs",
@@ -891,7 +1526,7 @@ def fetch_page_via_zyte(url: str) -> str:
 def read_store_list(csv_path: Path) -> List[Dict[str, float]]:
     stores: List[Dict[str, float]] = []
     seen_codes = set()
-    with open(csv_path, "r", encoding="utf-8") as f:
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
@@ -965,30 +1600,108 @@ def crawl_shop(shop_code: str, shop_name: str, url: str, opening_type: str = "de
         try:
             html = fetch_page_via_zyte(url)
             payload = extract_vendor_payload(html)
-            if payload is None:
+            provider_payload = extract_provider_payload(html) if ZYTE_DOM_MENUS else None
+            provider_identity = _provider_identity(provider_payload)
+            actual_vendor_codes = {
+                code
+                for code in (
+                    _payload_vendor_code(payload),
+                    str(provider_identity.get("code")) if provider_identity.get("code") else None,
+                )
+                if code
+            }
+            if actual_vendor_codes and any(
+                code != str(shop_code) for code in actual_vendor_codes
+            ):
                 logger.warning(
-                    "[NO_DATA] %s (%s) -> HTML parse failed (attempt %s)",
+                    "[VENDOR_MISMATCH] requested=%s (%s) rendered_vendor_codes=%s; "
+                    "rejecting redirected page",
                     shop_code,
                     shop_name,
-                    attempt,
+                    sorted(actual_vendor_codes),
                 )
-                _dump_json_debug(html, url, suffix="html_parse_failed")
-                continue
-            if not _has_menus(payload):
-                if ZYTE_DOM_MENUS:
+                return None
+            if payload is None:
+                if provider_payload:
+                    payload = {
+                        "vendor": {
+                            "data": {
+                                "code": provider_identity.get("code") or shop_code,
+                                "name": provider_identity.get("name") or shop_name,
+                            }
+                        }
+                    }
+                    logger.warning(
+                        "[META_FALLBACK] %s (%s) PRELOADED_STATE unavailable; "
+                        "using Provider identity",
+                        shop_code,
+                        shop_name,
+                    )
+                else:
+                    logger.warning(
+                        "[NO_DATA] %s (%s) -> embedded state parse failed (attempt %s)",
+                        shop_code,
+                        shop_name,
+                        attempt,
+                    )
+                    _dump_json_debug(html, url, suffix="html_parse_failed")
+                    return None
+
+            provider_type_mismatch = False
+            if ZYTE_DOM_MENUS and not _has_complete_menu(payload, opening_type):
+                provider_menus, provider_types = _provider_menus_to_panda(
+                    provider_payload,
+                    str(shop_code),
+                    opening_type,
+                )
+                if provider_menus and _menu_product_metrics({"menus": provider_menus})[2] > 0:
+                    _merge_menus_for_postprocess(payload, provider_menus)
+                    menu_count, category_count, product_count = _menu_product_metrics(payload)
+                    logger.info(
+                        "[MENU_PROVIDER] %s (%s) merged Apollo menu "
+                        "(opening_type=%s menus=%s categories=%s products=%s)",
+                        shop_code,
+                        shop_name,
+                        opening_type,
+                        menu_count,
+                        category_count,
+                        product_count,
+                    )
+                elif provider_types and opening_type.upper() not in provider_types:
+                    provider_type_mismatch = True
+                    logger.warning(
+                        "[MENU_TYPE_MISMATCH] %s (%s) requested=%s provider_types=%s",
+                        shop_code,
+                        shop_name,
+                        opening_type.upper(),
+                        provider_types,
+                    )
+
+                if not _has_complete_menu(payload, opening_type) and not provider_type_mismatch:
                     categories = _extract_dom_menu_categories(html)
                     if categories:
                         menus = _dom_categories_to_panda_menus(categories)
                         if menus:
+                            for menu in menus:
+                                menu["expedition_type"] = opening_type.upper()
+                                menu["vendor_code"] = shop_code
                             _merge_menus_for_postprocess(payload, menus)
+                            _, category_count, product_count = _menu_product_metrics(payload)
                             logger.info(
-                                "[MENU_DOM] %s (%s) merged menus from DOM (categories=%s)",
+                                "[MENU_DOM] %s (%s) merged menus from visible DOM "
+                                "(categories=%s products=%s)",
                                 shop_code,
                                 shop_name,
-                                len(categories),
+                                category_count,
+                                product_count,
                             )
 
-                if not _has_menus(payload) and ZYTE_VENDOR_API_FALLBACK and not ZYTE_SKIP_VENDOR_API_FALLBACK:
+                if (
+                    not _has_complete_menu(payload, opening_type)
+                    and not provider_type_mismatch
+                    and ZYTE_VENDOR_API_FALLBACK
+                    and not ZYTE_SKIP_VENDOR_API_FALLBACK
+                ):
                     vendor_code = _infer_vendor_code(payload, url, html)
                     lat, lng = _infer_coords(payload, html)
                     if vendor_code:
@@ -1002,6 +1715,18 @@ def crawl_shop(shop_code: str, shop_name: str, url: str, opening_type: str = "de
                                 vendor_code,
                                 opening_type,
                             )
+
+                if not _has_complete_menu(payload, opening_type):
+                    logger.warning(
+                        "[NO_MENU] %s (%s) no complete %s menu after Provider/DOM "
+                        "parsing (attempt %s/%s)",
+                        shop_code,
+                        shop_name,
+                        opening_type,
+                        attempt,
+                        MAX_ACCESS_DENIED_RETRIES,
+                    )
+                    return None
 
             return payload
         except AccessDeniedError:
@@ -1023,6 +1748,8 @@ def crawl_shop(shop_code: str, shop_name: str, url: str, opening_type: str = "de
                 )
                 time.sleep(RECAPTCHA_WAIT)
             continue
+        except CrawlWindowClosed:
+            raise
         except Exception as e:
             logger.error("[ERROR] %s (%s) fetch failed: %s", shop_code, shop_name, e)
             break
@@ -1068,10 +1795,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
+    global PANDA_WORKERS, TODAY
 
-    global PANDA_WORKERS
+    args = parse_args()
+    run_lock = acquire_run_lock()
     PANDA_WORKERS = max(1, args.num_workers)
+    TODAY = resolve_run_date(args.opening_type, bool(args.limit_for_testing))
 
     if args.item_parse:
         warn_msg = "[WARN] item_parse enabled -> forcing browser rendering for full menu items."
@@ -1085,10 +1814,36 @@ def main() -> int:
         if ZYTE_DOM_MENUS:
             set_dom_menus(False)
 
-    if not LOCATION_CSV_PATH.exists():
-        raise FileNotFoundError(f"CSV not found: {LOCATION_CSV_PATH}")
+    input_csv = (
+        LOCATION_CSV_PATH
+        if args.limit_for_testing
+        else prepare_input_snapshot(TODAY)
+    )
+    if not OPENING_HOURS_CSV.exists():
+        raise FileNotFoundError(
+            f"opening-hours CSV not found: {OPENING_HOURS_CSV}"
+        )
 
-    stores = read_store_list(LOCATION_CSV_PATH)
+    opening_hours = OpeningHoursIndex.load(OPENING_HOURS_CSV, "foodpanda")
+    source_date = opening_hours.latest_source_date
+    logger.info(
+        "[SCHEDULE] Loaded opening hours: known=%d status_rows=%d "
+        "invalid=%d source_date=%s",
+        len(opening_hours.schedules),
+        len(opening_hours.statuses),
+        opening_hours.invalid_rows,
+        source_date or "unknown",
+    )
+    if source_date:
+        age_days = (datetime.now(TAIPEI_TZ).date() - source_date).days
+        if age_days > 14:
+            logger.warning(
+                "[SCHEDULE] Opening-hours data is %d days old (source_date=%s)",
+                age_days,
+                source_date,
+            )
+
+    stores = read_store_list(input_csv)
     if args.item_parse and args.parse_part:
         target_mod = 0 if args.parse_part == "A" else 1
         total_before = len(stores)
@@ -1116,9 +1871,20 @@ def main() -> int:
     success_count = 0
     cache_count = 0
     skip_count = 0
+    deferred_count = 0
     run_start = time.perf_counter()
     opening_types = resolve_opening_types(args.opening_type)
     total_jobs = total_stores * len(opening_types)
+
+    if not args.limit_for_testing:
+        update_active_run(
+            TODAY,
+            args.opening_type,
+            "running",
+            input=str(input_csv),
+            totalStores=total_stores,
+            totalJobs=total_jobs,
+        )
 
     for opening_type in opening_types:
         os.makedirs(output_dir_for(args.opening_type, opening_type), exist_ok=True)
@@ -1140,16 +1906,51 @@ def main() -> int:
             ext="json",
         )
 
-        if SKIP_EXISTING_OUTPUT and out_file.exists():
+        if SKIP_EXISTING_OUTPUT and is_successful_output(
+            out_file,
+            require_menu=args.item_parse,
+            opening_type=opening_type,
+            expected_shop_code=str(shop_code),
+        ):
             return "cache"
+
+        decision = opening_hours.decision(
+            str(shop_code),
+            closing_buffer=OPENING_CLOSING_BUFFER,
+            minimum_buffer=OPENING_MINIMUM_BUFFER,
+        )
+        if decision.known and not decision.eligible:
+            return "deferred"
 
         delay_sec = random.uniform(PER_REQUEST_DELAY_MIN_SEC, PER_REQUEST_DELAY_MAX_SEC)
         if delay_sec > 0:
             time.sleep(delay_sec)
 
-        data = crawl_shop(shop_code, shop_name, url, opening_type=opening_type)
-        if data is None:
-            return "fail"
+        decision = opening_hours.decision(
+            str(shop_code),
+            closing_buffer=OPENING_CLOSING_BUFFER,
+            minimum_buffer=OPENING_MINIMUM_BUFFER,
+        )
+        if decision.known and not decision.eligible:
+            return "deferred"
+
+        _THREAD_LOCAL.dispatch_deadline = decision.deadline if decision.known else None
+        try:
+            data = crawl_shop(shop_code, shop_name, url, opening_type=opening_type)
+            if data is None:
+                return "fail"
+            if args.item_parse and not _has_complete_menu(data, opening_type):
+                logger.warning(
+                    "[INCOMPLETE] %s (%s, %s) result has no complete menu",
+                    shop_code,
+                    shop_name,
+                    opening_type,
+                )
+                return "fail"
+        except CrawlWindowClosed:
+            return "deferred"
+        finally:
+            _THREAD_LOCAL.dispatch_deadline = None
 
         try:
             with open(out_file, "w", encoding="utf-8") as fw:
@@ -1204,21 +2005,150 @@ def main() -> int:
                 status_line,
             )
 
-    try:
-        if PANDA_WORKERS <= 1:
-            for store in stores:
-                for opening_type in opening_types:
-                    _record_result(store, opening_type, _process_store(store, opening_type))
+    ready: List[Tuple[float, int, Tuple[Dict[str, float], str]]] = []
+    waiting: List[Tuple[float, int, Tuple[Dict[str, float], str]]] = []
+    unknown: Deque[Tuple[Dict[str, float], str]] = deque()
+    sequence = 0
+
+    def _enqueue_job(
+        job: Tuple[Dict[str, float], str],
+        now: Optional[datetime] = None,
+    ) -> None:
+        nonlocal sequence
+        store, _ = job
+        decision = opening_hours.decision(
+            str(store["shopCode"]),
+            now=now,
+            closing_buffer=OPENING_CLOSING_BUFFER,
+            minimum_buffer=OPENING_MINIMUM_BUFFER,
+        )
+        sequence += 1
+        if not decision.known:
+            unknown.append(job)
+        elif decision.eligible and decision.deadline:
+            heapq.heappush(
+                ready, (decision.deadline.timestamp(), sequence, job)
+            )
+        elif decision.next_open:
+            heapq.heappush(
+                waiting, (decision.next_open.timestamp(), sequence, job)
+            )
         else:
-            logger.info("[INFO] Running with %d workers (concurrent)", PANDA_WORKERS)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=PANDA_WORKERS) as executor:
-                jobs = [(store, opening_type) for store in stores for opening_type in opening_types]
-                future_to_job = {
-                    executor.submit(_process_store, store, opening_type): (store, opening_type)
-                    for store, opening_type in jobs
-                }
-                for future in concurrent.futures.as_completed(future_to_job):
-                    store, opening_type = future_to_job[future]
+            unknown.append(job)
+
+    initial_now = datetime.now(TAIPEI_TZ)
+    for store in stores:
+        for opening_type in opening_types:
+            out_file = output_file_for(
+                store["lat"],
+                store["lng"],
+                store["shopCode"],
+                opening_type=opening_type,
+                run_opening_type=args.opening_type,
+                ext="json",
+            )
+            if SKIP_EXISTING_OUTPUT and is_successful_output(
+                out_file,
+                require_menu=args.item_parse,
+                opening_type=opening_type,
+                expected_shop_code=str(store["shopCode"]),
+            ):
+                success_count += 1
+                cache_count += 1
+            else:
+                _enqueue_job((store, opening_type), initial_now)
+
+    logger.info(
+        "[SCHEDULE] Plan cache=%d ready_open=%d waiting=%d unknown=%d "
+        "closing_buffer=%.1fm workers=%d",
+        cache_count,
+        len(ready),
+        len(waiting),
+        len(unknown),
+        OPENING_CLOSING_BUFFER.total_seconds() / 60,
+        PANDA_WORKERS,
+    )
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=PANDA_WORKERS) as executor:
+            future_to_job: Dict[
+                concurrent.futures.Future, Tuple[Dict[str, float], str]
+            ] = {}
+            last_wait_target: Optional[int] = None
+            while ready or waiting or unknown or future_to_job:
+                now = datetime.now(TAIPEI_TZ)
+
+                while waiting and waiting[0][0] <= now.timestamp():
+                    _, _, job = heapq.heappop(waiting)
+                    _enqueue_job(job, now)
+
+                while len(future_to_job) < PANDA_WORKERS:
+                    job: Optional[Tuple[Dict[str, float], str]] = None
+                    while ready and job is None:
+                        _, _, candidate = heapq.heappop(ready)
+                        candidate_store, _ = candidate
+                        decision = opening_hours.decision(
+                            str(candidate_store["shopCode"]),
+                            now=now,
+                            closing_buffer=OPENING_CLOSING_BUFFER,
+                            minimum_buffer=OPENING_MINIMUM_BUFFER,
+                        )
+                        if decision.known and decision.eligible:
+                            job = candidate
+                        else:
+                            _enqueue_job(candidate, now)
+
+                    opening_soon = bool(
+                        waiting
+                        and waiting[0][0] - now.timestamp()
+                        <= OPENING_CLOSING_BUFFER.total_seconds()
+                    )
+                    if job is None and unknown and not opening_soon:
+                        job = unknown.popleft()
+                    if job is None:
+                        break
+
+                    store, opening_type = job
+                    future = executor.submit(_process_store, store, opening_type)
+                    future_to_job[future] = job
+
+                if not future_to_job:
+                    if not (ready or waiting or unknown):
+                        break
+                    sleep_seconds = SCHEDULER_POLL_SECONDS
+                    if waiting:
+                        sleep_seconds = min(
+                            sleep_seconds,
+                            max(0.1, waiting[0][0] - time.time()),
+                        )
+                        wait_target = int(waiting[0][0])
+                        if wait_target != last_wait_target:
+                            logger.info(
+                                "[SCHEDULE] No eligible known store; waiting "
+                                "until %s (waiting=%d unknown=%d)",
+                                datetime.fromtimestamp(
+                                    wait_target, TAIPEI_TZ
+                                ).isoformat(),
+                                len(waiting),
+                                len(unknown),
+                            )
+                            last_wait_target = wait_target
+                    time.sleep(sleep_seconds)
+                    continue
+
+                wait_timeout = SCHEDULER_POLL_SECONDS
+                if waiting:
+                    wait_timeout = min(
+                        wait_timeout,
+                        max(0.1, waiting[0][0] - time.time()),
+                    )
+                completed, _ = concurrent.futures.wait(
+                    future_to_job,
+                    timeout=wait_timeout,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in completed:
+                    store, opening_type = future_to_job.pop(future)
                     try:
                         result = future.result()
                     except Exception as exc:
@@ -1229,7 +2159,12 @@ def main() -> int:
                             exc,
                         )
                         result = "fail"
-                    _record_result(store, opening_type, result)
+
+                    if result == "deferred":
+                        deferred_count += 1
+                        _enqueue_job((store, opening_type))
+                    else:
+                        _record_result(store, opening_type, result)
     except KeyboardInterrupt:
         elapsed = time.perf_counter() - run_start
         logger.warning("Interrupted; completed JSON files remain available as checkpoints")
@@ -1240,11 +2175,25 @@ def main() -> int:
                 f"Opening type: {args.opening_type}\n"
                 f"Completed jobs: {success_count}/{total_jobs}\n"
                 f"Failed jobs: {skip_count}\n"
+                f"Deferred dispatches: {deferred_count}\n"
                 f"Elapsed: {elapsed / 3600:.2f} hours\n"
                 f"Output: {OUTPUT_BASE}"
             ),
             "high",
         )
+        if not args.limit_for_testing:
+            update_active_run(
+                TODAY,
+                args.opening_type,
+                "running",
+                input=str(input_csv),
+                totalStores=total_stores,
+                totalJobs=total_jobs,
+                completedJobs=success_count,
+                failedJobs=skip_count,
+                interrupted=True,
+            )
+        run_lock.close()
         return 130
 
     elapsed = time.perf_counter() - run_start
@@ -1256,10 +2205,27 @@ def main() -> int:
         f"Fresh success: {success_count - cache_count}\n"
         f"Cache: {cache_count}\n"
         f"Failed: {skip_count}\n"
+        f"Deferred dispatches: {deferred_count}\n"
+        f"Zyte request attempts: {ZYTE_REQUEST_ATTEMPTS}\n"
+        f"Zyte successful responses: {ZYTE_SUCCESSFUL_RESPONSES}\n"
+        f"Zyte response seconds: {ZYTE_RESPONSE_SECONDS:.1f}\n"
         f"Elapsed: {elapsed / 3600:.2f} hours\n"
         f"Output: {OUTPUT_BASE}"
     )
     logger.info(summary.replace("\n", " | "))
+    if not args.limit_for_testing:
+        update_active_run(
+            TODAY,
+            args.opening_type,
+            "complete" if skip_count == 0 else "running",
+            input=str(input_csv),
+            totalStores=total_stores,
+            totalJobs=total_jobs,
+            successfulJobs=success_count,
+            cachedJobs=cache_count,
+            failedJobs=skip_count,
+            deferredDispatches=deferred_count,
+        )
     if args.limit_for_testing:
         title = "Foodpanda Zyte menu crawler test completed"
         priority = "default" if skip_count == 0 else "high"
@@ -1270,6 +2236,7 @@ def main() -> int:
         title = "Foodpanda Zyte menu crawler incomplete"
         priority = "urgent"
     send_notification(title, summary, priority)
+    run_lock.close()
     return 0 if skip_count == 0 or args.limit_for_testing else 1
 
 
@@ -1307,3 +2274,6 @@ if __name__ == "__main__":
 #   python zyte_panda_menu.py --item-parse --parse-part A --num-workers 16
 # with menu item parsing, part B: (友承)
 #   python zyte_panda_menu.py --item-parse --parse-part B --num-workers 16
+
+# 友承已不再協作，因此現在的指令為
+#  python zyte_panda_menu.py --item-parse --opening-type both --num-workers 16
