@@ -94,6 +94,15 @@ Only one Foodpanda crawler can run at a time. A full run locks its rolling.csv
 snapshot under `.runs/`; after interruption, the next invocation with the same
 `--opening-type` resumes the same run date and reuses completed JSON files.
 
+Full runs stop automatically after at least 99.5% of jobs have been processed
+when no immediately eligible job remains and the scheduler would otherwise wait
+for another opening window. They also stop after 120 hours. In-flight requests
+are allowed to finish. Override these defaults with
+`PANDA_AUTO_STOP_PERCENT`/`MENU_AUTO_STOP_PERCENT` and
+`PANDA_MAX_RUNTIME_HOURS`/`MENU_MAX_RUNTIME_HOURS`; use `0` to disable either
+limit. Auto-stopped runs write separate pending and failed manifests under
+`.runs/YYYY-MM-DD/` and do not resume automatically on the next invocation.
+
 ## Output
 - JSON:
   - single mode (`delivery` or `pickup`): `../panda_data_js/panda_menu/YYYY-MM-DD/`

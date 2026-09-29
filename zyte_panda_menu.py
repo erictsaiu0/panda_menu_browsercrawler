@@ -18,6 +18,7 @@ import fcntl
 import heapq
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -117,6 +118,27 @@ OPENING_MINIMUM_BUFFER = timedelta(
 )
 SCHEDULER_POLL_SECONDS = max(
     1.0, float(os.environ.get("MENU_SCHEDULER_POLL_SECONDS", "60"))
+)
+AUTO_STOP_PERCENT = min(
+    100.0,
+    max(
+        0.0,
+        float(
+            os.environ.get(
+                "PANDA_AUTO_STOP_PERCENT",
+                os.environ.get("MENU_AUTO_STOP_PERCENT", "99.5"),
+            )
+        ),
+    ),
+)
+MAX_RUNTIME_HOURS = max(
+    0.0,
+    float(
+        os.environ.get(
+            "PANDA_MAX_RUNTIME_HOURS",
+            os.environ.get("MENU_MAX_RUNTIME_HOURS", "120"),
+        )
+    ),
 )
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -1872,9 +1894,17 @@ def main() -> int:
     cache_count = 0
     skip_count = 0
     deferred_count = 0
+    failed_jobs: List[dict] = []
+    stop_reason: Optional[str] = None
     run_start = time.perf_counter()
     opening_types = resolve_opening_types(args.opening_type)
     total_jobs = total_stores * len(opening_types)
+    auto_stop_target = (
+        math.ceil(total_jobs * AUTO_STOP_PERCENT / 100.0)
+        if AUTO_STOP_PERCENT > 0
+        else 0
+    )
+    max_runtime_seconds = MAX_RUNTIME_HOURS * 3600.0
 
     if not args.limit_for_testing:
         update_active_run(
@@ -1996,6 +2026,17 @@ def main() -> int:
             )
         else:
             skip_count += 1
+            failed_jobs.append(
+                {
+                    "shopCode": str(shop_code),
+                    "shopName": shop_name,
+                    "openingType": opening_type,
+                    "latitude": store["lat"],
+                    "longitude": store["lng"],
+                    "output": str(out_file),
+                    "reason": "crawl_failed",
+                }
+            )
             status_line = progress_snapshot(run_start, success_count, skip_count, total_jobs)
             logger.info(
                 "[SKIP] %s (%s, %s) failed | %s",
@@ -2060,13 +2101,15 @@ def main() -> int:
 
     logger.info(
         "[SCHEDULE] Plan cache=%d ready_open=%d waiting=%d unknown=%d "
-        "closing_buffer=%.1fm workers=%d",
+        "closing_buffer=%.1fm workers=%d auto_stop=%.3f%% max_runtime=%.1fh",
         cache_count,
         len(ready),
         len(waiting),
         len(unknown),
         OPENING_CLOSING_BUFFER.total_seconds() / 60,
         PANDA_WORKERS,
+        AUTO_STOP_PERCENT,
+        MAX_RUNTIME_HOURS,
     )
 
     try:
@@ -2077,12 +2120,20 @@ def main() -> int:
             last_wait_target: Optional[int] = None
             while ready or waiting or unknown or future_to_job:
                 now = datetime.now(TAIPEI_TZ)
+                runtime_limit_reached = bool(
+                    not args.limit_for_testing
+                    and max_runtime_seconds > 0
+                    and time.perf_counter() - run_start >= max_runtime_seconds
+                )
 
                 while waiting and waiting[0][0] <= now.timestamp():
                     _, _, job = heapq.heappop(waiting)
                     _enqueue_job(job, now)
 
-                while len(future_to_job) < PANDA_WORKERS:
+                while (
+                    not runtime_limit_reached
+                    and len(future_to_job) < PANDA_WORKERS
+                ):
                     job: Optional[Tuple[Dict[str, float], str]] = None
                     while ready and job is None:
                         _, _, candidate = heapq.heappop(ready)
@@ -2113,7 +2164,39 @@ def main() -> int:
                     future_to_job[future] = job
 
                 if not future_to_job:
+                    if runtime_limit_reached:
+                        stop_reason = "max_runtime"
+                        logger.warning(
+                            "[AUTO_STOP] Maximum runtime reached: %.1f hours "
+                            "(processed=%d/%d ready=%d waiting=%d unknown=%d)",
+                            MAX_RUNTIME_HOURS,
+                            success_count + skip_count,
+                            total_jobs,
+                            len(ready),
+                            len(waiting),
+                            len(unknown),
+                        )
+                        break
                     if not (ready or waiting or unknown):
+                        break
+                    processed_jobs = success_count + skip_count
+                    if (
+                        not args.limit_for_testing
+                        and auto_stop_target > 0
+                        and processed_jobs >= auto_stop_target
+                        and waiting
+                        and not ready
+                        and not unknown
+                    ):
+                        stop_reason = "threshold_waiting"
+                        logger.info(
+                            "[AUTO_STOP] Processed %.3f%% (%d/%d); no immediately "
+                            "eligible job remains, leaving %d waiting jobs for retry",
+                            processed_jobs * 100.0 / total_jobs,
+                            processed_jobs,
+                            total_jobs,
+                            len(waiting),
+                        )
                         break
                     sleep_seconds = SCHEDULER_POLL_SECONDS
                     if waiting:
@@ -2196,7 +2279,73 @@ def main() -> int:
         run_lock.close()
         return 130
 
+    pending_jobs: List[dict] = []
+    pending_by_key: Dict[Tuple[str, str], dict] = {}
+
+    def _remember_pending(
+        job: Tuple[Dict[str, float], str],
+        queue: str,
+        next_eligible_at: Optional[float] = None,
+    ) -> None:
+        store, opening_type = job
+        key = (str(store["shopCode"]), opening_type)
+        record = {
+            "shopCode": key[0],
+            "shopName": store["shopName"],
+            "openingType": opening_type,
+            "latitude": store["lat"],
+            "longitude": store["lng"],
+            "queue": queue,
+        }
+        if next_eligible_at is not None:
+            record[
+                "dispatchDeadline" if queue == "ready" else "nextEligibleAt"
+            ] = datetime.fromtimestamp(next_eligible_at, TAIPEI_TZ).isoformat()
+        pending_by_key[key] = record
+
+    for deadline, _, job in ready:
+        _remember_pending(job, "ready", deadline)
+    for next_open, _, job in waiting:
+        _remember_pending(job, "waiting", next_open)
+    for job in unknown:
+        _remember_pending(job, "unknown")
+    pending_jobs = sorted(
+        pending_by_key.values(),
+        key=lambda item: (item["shopCode"], item["openingType"]),
+    )
+
+    run_artifact_dir = OUTPUT_BASE / ".runs" / TODAY
+    pending_path = run_artifact_dir / f"pending_{args.opening_type}.json"
+    failed_path = run_artifact_dir / f"failed_{args.opening_type}.json"
+    if not args.limit_for_testing:
+        if pending_jobs:
+            atomic_write_json(
+                pending_path,
+                {
+                    "runDate": TODAY,
+                    "openingType": args.opening_type,
+                    "stopReason": stop_reason,
+                    "count": len(pending_jobs),
+                    "jobs": pending_jobs,
+                },
+            )
+        elif pending_path.exists():
+            pending_path.unlink()
+        if failed_jobs:
+            atomic_write_json(
+                failed_path,
+                {
+                    "runDate": TODAY,
+                    "openingType": args.opening_type,
+                    "count": len(failed_jobs),
+                    "jobs": failed_jobs,
+                },
+            )
+        elif failed_path.exists():
+            failed_path.unlink()
+
     elapsed = time.perf_counter() - run_start
+    processed_jobs = success_count + skip_count
     summary = (
         f"Run date: {TODAY}\n"
         f"Opening type: {args.opening_type}\n"
@@ -2205,6 +2354,9 @@ def main() -> int:
         f"Fresh success: {success_count - cache_count}\n"
         f"Cache: {cache_count}\n"
         f"Failed: {skip_count}\n"
+        f"Pending: {len(pending_jobs)}\n"
+        f"Processed: {processed_jobs}/{total_jobs}\n"
+        f"Stop reason: {stop_reason or 'queue_exhausted'}\n"
         f"Deferred dispatches: {deferred_count}\n"
         f"Zyte request attempts: {ZYTE_REQUEST_ATTEMPTS}\n"
         f"Zyte successful responses: {ZYTE_SUCCESSFUL_RESPONSES}\n"
@@ -2214,21 +2366,28 @@ def main() -> int:
     )
     logger.info(summary.replace("\n", " | "))
     if not args.limit_for_testing:
+        run_status = stop_reason or ("complete" if skip_count == 0 else "running")
         update_active_run(
             TODAY,
             args.opening_type,
-            "complete" if skip_count == 0 else "running",
+            run_status,
             input=str(input_csv),
             totalStores=total_stores,
             totalJobs=total_jobs,
+            processedJobs=processed_jobs,
             successfulJobs=success_count,
             cachedJobs=cache_count,
             failedJobs=skip_count,
+            pendingJobs=len(pending_jobs),
+            stoppedReason=stop_reason,
             deferredDispatches=deferred_count,
         )
     if args.limit_for_testing:
         title = "Foodpanda Zyte menu crawler test completed"
         priority = "default" if skip_count == 0 else "high"
+    elif stop_reason:
+        title = "Foodpanda Zyte menu crawler auto-stopped"
+        priority = "high"
     elif skip_count == 0:
         title = "Foodpanda Zyte menu crawler completed"
         priority = "high"
@@ -2237,7 +2396,7 @@ def main() -> int:
         priority = "urgent"
     send_notification(title, summary, priority)
     run_lock.close()
-    return 0 if skip_count == 0 or args.limit_for_testing else 1
+    return 0 if stop_reason or skip_count == 0 or args.limit_for_testing else 1
 
 
 if __name__ == "__main__":
@@ -2275,5 +2434,9 @@ if __name__ == "__main__":
 # with menu item parsing, part B: (友承)
 #   python zyte_panda_menu.py --item-parse --parse-part B --num-workers 16
 
-# 友承已不再協作，因此現在的指令為
-#  python zyte_panda_menu.py --item-parse --opening-type both --num-workers 16
+# 友承已不再協作，因此每月完整重抓的指令為：
+#   python zyte_panda_menu.py --item-parse --opening-type both --num-workers 16
+# 99.5% 無可立即抓取任務時停止、最長 120 小時，皆已是預設值，不必加參數。
+# 開新月份前先檢查 active_run_both.json；只有 status=running 會續跑舊批次。
+# 若要放棄舊批次並開新批次，先備份或移走該狀態檔。threshold_waiting 或
+# max_runtime 狀態不會自動續跑，不必刪除。
